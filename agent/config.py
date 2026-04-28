@@ -22,11 +22,22 @@ REFLECTION_THRESHOLD = 0.75  # score below this triggers a reflection loop
 # ── Confidence gate ───────────────────────────────────────────────────────────
 CONFIDENCE_GATE = 0.35       # refuse to answer if confidence stays below this
 
+# ── Reasoning enforcement ────────────────────────────────────────────────────
+REASONING_ENFORCEMENT = True  # True → agent must produce explicit ReasoningPlan before tools
+
+# ── Grounding (anti-hallucination) ────────────────────────────────────────────
+GROUNDING_ENABLED = True      # True → every claim in the answer checked against tool results
+GROUNDING_FAIL_THRESHOLD = 0.60   # below this ratio → reject and force revision
+GROUNDING_WARN_THRESHOLD = 0.85   # below this → warn but accept
+
+# ── Self-critique ─────────────────────────────────────────────────────────────
+SELF_CRITIQUE_ENABLED = True  # True → agent critiques its own draft before validator
+
 # ── Meta-validator ────────────────────────────────────────────────────────────
-VALIDATOR_ENABLED = True     # second agent independently reviews every answer
+VALIDATOR_ENABLED = True      # True → second independent agent reviews every answer
 
 # ── Human-in-the-loop ────────────────────────────────────────────────────────
-HUMAN_IN_THE_LOOP = False    # True → pause before high-stakes tool calls for confirmation
+HUMAN_IN_THE_LOOP = False     # True → pause before high-stakes tool calls for confirmation
 HITL_TOOLS = []              # tool names that require HITL approval (empty = all tools)
                               # e.g. ["write_database", "send_email", "make_api_call"]
 

@@ -1,14 +1,27 @@
 """
-Main agent entry point.
-Full stack: PydanticAI + Arize Phoenix + Langfuse + Reflexion +
-            ChromaDB memory + Meta-validator + Human-in-the-loop +
-            Multi-agent orchestrator + JSON logs + Cost tracking
+Main agent entry point — full reasoning + anti-hallucination pipeline.
 
-Modes (set in agent/config.py):
-  MULTI_AGENT_MODE = True   → orchestrator routes to specialist agents
-  MULTI_AGENT_MODE = False  → single flat agent (faster for simple tasks)
-  VALIDATOR_ENABLED = True  → meta-validator checks every answer
-  HUMAN_IN_THE_LOOP = True  → pauses before high-stakes tool calls
+Execution chain (all steps configurable in agent/config.py):
+
+  1. REASONING PLAN   — explicit plan before any tool is called
+                        (agent/reasoning.py → ReasoningPlan)
+
+  2. EXECUTE          — tools run with plan as context prefix
+                        (PydanticAI agent, async parallel tools)
+
+  3. SELF-CRITIQUE    — agent critiques its own draft vs evidence + plan
+                        (agent/critique.py → revised answer)
+
+  4. GROUNDING CHECK  — every claim verified against tool results (evidence ledger)
+                        (agent/grounding.py → hard anti-hallucination guarantee)
+
+  5. EXTERNAL VALIDATOR — independent agent reviews the grounded, critiqued answer
+                        (agent/validator.py → ValidationResult)
+
+  6. REFLEXION LOOP   — if any step fails, feed structured feedback back and retry
+                        (max MAX_REFLECTIONS attempts)
+
+  7. CONFIDENCE GATE  — refuse to answer if confidence stays below threshold
 
 Run:
     python agent/agent.py --input "your task"
@@ -35,13 +48,21 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from agent.config import (
-    MODEL, MAX_REFLECTIONS, REFLECTION_THRESHOLD, CONFIDENCE_GATE,
-    VALIDATOR_ENABLED, MULTI_AGENT_MODE,
+    MODEL,
+    MAX_REFLECTIONS, REFLECTION_THRESHOLD, CONFIDENCE_GATE,
+    REASONING_ENFORCEMENT,
+    GROUNDING_ENABLED, GROUNDING_FAIL_THRESHOLD,
+    SELF_CRITIQUE_ENABLED,
+    VALIDATOR_ENABLED,
+    MULTI_AGENT_MODE,
     HUMAN_IN_THE_LOOP, HITL_TOOLS,
     PHOENIX_ENABLED, PHOENIX_PORT,
     PROMPTS_DIR, ACTIVE_PROMPT_VERSION, LANGFUSE_ENABLED,
 )
 from agent.memory import AgentMemory
+from agent.reasoning import build_reasoning_plan, plan_to_context, ReasoningPlan
+from agent.grounding import EvidenceLedger, check_grounding, grounding_feedback
+from agent.critique import self_critique
 from agent.validator import validate
 
 console = Console()
@@ -68,7 +89,7 @@ def setup_observability() -> None:
         _phoenix_started = True
         console.print(f"[green]Phoenix →[/green] http://localhost:{PHOENIX_PORT}")
     except ImportError:
-        console.print("[yellow]Phoenix not installed — skipping. pip install arize-phoenix[/yellow]")
+        console.print("[yellow]Phoenix not installed — skipping.[/yellow]")
 
 
 # ── Prompt management ─────────────────────────────────────────────────────────
@@ -93,32 +114,28 @@ def load_system_prompt(version: str = ACTIVE_PROMPT_VERSION) -> str:
     return data["prompt"]
 
 
-# ── Human-in-the-loop wrapper ─────────────────────────────────────────────────
+# ── HITL wrapper ──────────────────────────────────────────────────────────────
 
-def _hitl_wrap(tool_fn):
-    """Wrap a tool function with a human approval checkpoint."""
+def _hitl_wrap(tool_fn, ledger: EvidenceLedger):
+    """Wrap tool with HITL checkpoint + evidence ledger logging."""
     import functools
 
     @functools.wraps(tool_fn)
     async def wrapper(ctx, *args, **kwargs):
         tool_name = tool_fn.__name__
-        needs_approval = HUMAN_IN_THE_LOOP and (
-            not HITL_TOOLS or tool_name in HITL_TOOLS
-        )
 
-        if needs_approval:
+        if HUMAN_IN_THE_LOOP and (not HITL_TOOLS or tool_name in HITL_TOOLS):
             console.print(
-                f"\n[bold yellow]HITL Checkpoint[/bold yellow] — "
-                f"Agent wants to call [cyan]{tool_name}[/cyan]\n"
-                f"Args: {kwargs or args}\n"
-                "Approve? [bold](y/n)[/bold] ",
+                f"\n[bold yellow]HITL[/bold yellow] — "
+                f"[cyan]{tool_name}[/cyan] args={kwargs or args}  Approve? (y/n) ",
                 end="",
             )
-            answer = input().strip().lower()
-            if answer != "y":
+            if input().strip().lower() != "y":
                 return {"status": "rejected_by_human", "tool": tool_name}
 
-        return await tool_fn(ctx, *args, **kwargs)
+        result = await tool_fn(ctx, *args, **kwargs)
+        ledger.add(tool_name, str(kwargs or args), str(result))
+        return result
 
     return wrapper
 
@@ -126,8 +143,8 @@ def _hitl_wrap(tool_fn):
 # ── Structured output ─────────────────────────────────────────────────────────
 
 class AgentAnswer(BaseModel):
-    answer: str
-    reasoning: str
+    answer:     str
+    reasoning:  str
     confidence: float
     tools_used: list[str]
 
@@ -139,14 +156,16 @@ class RunMeta(BaseModel):
     latency_ms:       int   = 0
     reflections:      int   = 0
     final_score:      float = 0.0
+    grounding_ratio:  float = 1.0
     validator_passed: bool  = True
     confidence_gated: bool  = False
-    mode:             str   = "single"   # "single" | "multi-agent"
+    self_critiqued:   bool  = False
+    mode:             str   = "single"
 
 
-# ── Single-agent builder ──────────────────────────────────────────────────────
+# ── Agent factory ─────────────────────────────────────────────────────────────
 
-def build_agent(system_prompt: str) -> Agent:
+def build_agent(system_prompt: str, ledger: EvidenceLedger) -> Agent:
     from agent.tools import TOOLS
     agent: Agent[None, AgentAnswer] = Agent(
         model=f"anthropic:{MODEL}",
@@ -154,84 +173,126 @@ def build_agent(system_prompt: str) -> Agent:
         system_prompt=system_prompt,
     )
     for tool_fn in TOOLS:
-        agent.tool(_hitl_wrap(tool_fn) if HUMAN_IN_THE_LOOP else tool_fn)
+        agent.tool(_hitl_wrap(tool_fn, ledger))
     return agent
 
 
-# ── Scoring ───────────────────────────────────────────────────────────────────
+# ── Scoring (for reflexion) ───────────────────────────────────────────────────
 
-async def _score(result: AgentAnswer, task: str) -> tuple[float, str]:
+async def _score(answer: str, task: str) -> tuple[float, str]:
     try:
         import anthropic as anth
         client = anth.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         resp = client.messages.create(
-            model=MODEL,
-            max_tokens=150,
+            model=MODEL, max_tokens=150,
             messages=[{"role": "user", "content": (
-                f"Task: {task}\nAnswer: {result.answer}\n\n"
-                "Rate 0.0–1.0. Reply ONLY: <score>|<reason>. E.g. 0.85|Correct and complete."
+                f"Task: {task}\nAnswer: {answer}\n\n"
+                "Rate 0.0–1.0. Reply ONLY: <score>|<reason>."
             )}],
         )
         parts = resp.content[0].text.strip().split("|", 1)
         return float(parts[0].strip()), parts[1].strip() if len(parts) > 1 else ""
     except Exception:
-        return result.confidence, "Derived from confidence"
+        return 0.5, "score unavailable"
+
+
+# ── Core pipeline: one attempt ────────────────────────────────────────────────
+
+async def _single_attempt(
+    task: str,
+    context_prefix: str,
+    system_prompt: str,
+    reasoning_plan: ReasoningPlan,
+    ledger: EvidenceLedger,
+    is_multi: bool,
+) -> tuple[AgentAnswer, float]:
+    """Run one full attempt: execute → self-critique → grounding → validate → score."""
+
+    # ── Execute ───────────────────────────────────────────────────────────────
+    if is_multi:
+        from agent.orchestrator import MultiAgentOrchestrator, load_specialists
+        runner = MultiAgentOrchestrator(model=MODEL, specialists=load_specialists())
+        raw = await runner.run(context_prefix + task)
+        draft = AgentAnswer(
+            answer=raw.answer, reasoning=raw.reasoning,
+            confidence=raw.confidence, tools_used=raw.tools_used,
+        )
+    else:
+        agent = build_agent(system_prompt, ledger)
+        run_result = await agent.run(context_prefix + task)
+        draft = run_result.data
+
+    # ── Self-critique ─────────────────────────────────────────────────────────
+    critique_result = await self_critique(
+        task=task,
+        draft_answer=draft.answer,
+        draft_confidence=draft.confidence,
+        evidence_text=ledger.as_text(),
+        reasoning_plan_text=plan_to_context(reasoning_plan),
+    )
+    # Use revised answer + recalibrated confidence
+    draft.answer     = critique_result.revised_answer
+    draft.confidence = critique_result.revised_confidence
+
+    # ── Grounding check ───────────────────────────────────────────────────────
+    grounding = await check_grounding(task, draft.answer, ledger)
+
+    if grounding.verdict == "fail":
+        # Return low score so reflexion loop retries
+        return draft, grounding.grounding_ratio * 0.5
+
+    # ── External validator ────────────────────────────────────────────────────
+    if VALIDATOR_ENABLED:
+        validation = await validate(task, draft.answer, draft.reasoning, draft.confidence)
+        if not validation.passed:
+            return draft, validation.score
+
+    # ── Score ─────────────────────────────────────────────────────────────────
+    score, _ = await _score(draft.answer, task)
+    return draft, score
 
 
 # ── Reflexion loop ────────────────────────────────────────────────────────────
 
 async def _run_with_reflection(
-    runner,           # Agent or MultiAgentOrchestrator
     task: str,
+    system_prompt: str,
     memory_context: str,
     is_multi: bool,
-) -> tuple[AgentAnswer, int, float]:
-    feedback = memory_context
+) -> tuple[AgentAnswer, int, float, EvidenceLedger]:
     best_result: AgentAnswer | None = None
     best_score = 0.0
     num_reflections = 0
+    feedback = memory_context
 
     for attempt in range(1, MAX_REFLECTIONS + 1):
         console.print(f"\n[bold]Attempt {attempt}/{MAX_REFLECTIONS}[/bold]")
 
-        if is_multi:
-            raw = await runner.run(task + feedback)
-            # Convert AggregatedAnswer to AgentAnswer
-            result = AgentAnswer(
-                answer=raw.answer,
-                reasoning=raw.reasoning,
-                confidence=raw.confidence,
-                tools_used=raw.tools_used,
-            )
-        else:
-            run_result = await runner.run(task + feedback)
-            result = run_result.data
+        # Fresh ledger per attempt so evidence stays aligned with this run
+        ledger = EvidenceLedger()
 
-        # Meta-validator check
-        if VALIDATOR_ENABLED:
-            validation = await validate(task, result.answer, result.reasoning, result.confidence)
-            if not validation.passed and attempt < MAX_REFLECTIONS:
-                score = validation.score
-                reason = validation.critique
-                console.print(f"  Score: [yellow]{score:.2f}[/] (validator failed)")
-                if score > best_score:
-                    best_score = score
-                    best_result = result
-                num_reflections += 1
-                feedback = (
-                    f"\n\n[Reflection {attempt}] Validator score {score:.2f}/1.0. "
-                    f"Issues: {'; '.join(validation.issues)}. "
-                    f"Feedback: {validation.critique}"
-                )
-                console.print("  [yellow]Validator failed — reflecting...[/yellow]")
-                continue
-            score = validation.score
-            reason = "Validator passed"
-        else:
-            score, reason = await _score(result, task)
+        # Build reasoning plan before each attempt
+        tool_names = []
+        try:
+            from agent.tools import TOOLS
+            tool_names = [t.__name__ for t in TOOLS]
+        except Exception:
+            pass
+
+        reasoning_plan = await build_reasoning_plan(task + feedback, tool_names)
+        context_prefix = plan_to_context(reasoning_plan) if REASONING_ENFORCEMENT else ""
+
+        result, score = await _single_attempt(
+            task=task,
+            context_prefix=context_prefix + feedback,
+            system_prompt=system_prompt,
+            reasoning_plan=reasoning_plan,
+            ledger=ledger,
+            is_multi=is_multi,
+        )
 
         status_color = "green" if score >= REFLECTION_THRESHOLD else "yellow"
-        console.print(f"  Score: [{status_color}]{score:.2f}[/] — {reason}")
+        console.print(f"  Score: [{status_color}]{score:.2f}[/]")
 
         if score > best_score:
             best_score = score
@@ -243,26 +304,26 @@ async def _run_with_reflection(
 
         if attempt < MAX_REFLECTIONS:
             num_reflections += 1
-            feedback = (
+            # Build structured feedback from grounding + score
+            grounding = await check_grounding(task, result.answer, ledger)
+            feedback = grounding_feedback(grounding) if grounding.verdict == "fail" else (
                 f"\n\n[Reflection {attempt}] Score {score:.2f}. "
-                f"Issue: {reason}. Be more precise and complete."
+                f"Improve: be more precise, ground every claim in tool results."
             )
-            console.print("  [yellow]Reflecting and retrying...[/yellow]")
+            console.print("  [yellow]Retrying with structured feedback...[/yellow]")
 
-    return best_result, num_reflections, best_score
-
-
-# ── Cost ──────────────────────────────────────────────────────────────────────
-
-def _compute_cost(tokens_in: int, tokens_out: int) -> float:
-    return (tokens_in * _COST_PER_1M_IN + tokens_out * _COST_PER_1M_OUT) / 1_000_000
+    return best_result, num_reflections, best_score, ledger
 
 
-# ── JSON log ──────────────────────────────────────────────────────────────────
+# ── Cost + log ────────────────────────────────────────────────────────────────
+
+def _compute_cost(tin: int, tout: int) -> float:
+    return (tin * _COST_PER_1M_IN + tout * _COST_PER_1M_OUT) / 1_000_000
+
 
 def _write_log(task: str, result: AgentAnswer, meta: RunMeta) -> None:
-    log_path = LOGS_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
-    log_path.write_text(json.dumps({
+    path = LOGS_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
+    path.write_text(json.dumps({
         "timestamp":        datetime.now().isoformat(),
         "mode":             meta.mode,
         "input":            task,
@@ -276,8 +337,10 @@ def _write_log(task: str, result: AgentAnswer, meta: RunMeta) -> None:
         "latency_ms":       meta.latency_ms,
         "reflections":      meta.reflections,
         "final_score":      meta.final_score,
+        "grounding_ratio":  meta.grounding_ratio,
         "validator_passed": meta.validator_passed,
         "confidence_gated": meta.confidence_gated,
+        "self_critiqued":   meta.self_critiqued,
     }, indent=2))
 
 
@@ -290,49 +353,49 @@ async def main(task: str, return_meta: bool = False):
 
     memory_context = memory.retrieve(task)
     if memory_context:
-        console.print(f"[dim]Memory: {memory.count()} stored runs — injecting context[/dim]")
+        console.print(f"[dim]Memory: {memory.count()} runs — injecting context[/dim]")
 
-    console.print(Panel(
-        f"[bold cyan]Running Agent[/bold cyan]  "
-        f"[dim]mode={'multi-agent' if MULTI_AGENT_MODE else 'single'} | "
+    flags = (
+        f"reasoning={'on' if REASONING_ENFORCEMENT else 'off'} | "
+        f"grounding={'on' if GROUNDING_ENABLED else 'off'} | "
+        f"critique={'on' if SELF_CRITIQUE_ENABLED else 'off'} | "
         f"validator={'on' if VALIDATOR_ENABLED else 'off'} | "
-        f"HITL={'on' if HUMAN_IN_THE_LOOP else 'off'}[/dim]\n\n"
+        f"mode={'multi' if MULTI_AGENT_MODE else 'single'}"
+    )
+    console.print(Panel(
+        f"[bold cyan]Running Agent[/bold cyan]  [dim]{flags}[/dim]\n\n"
         f"{task[:200]}{'...' if len(task) > 200 else ''}",
         border_style="cyan",
     ))
 
     t0 = time.monotonic()
-
-    if MULTI_AGENT_MODE:
-        from agent.orchestrator import MultiAgentOrchestrator, load_specialists
-        runner = MultiAgentOrchestrator(model=MODEL, specialists=load_specialists())
-        mode = "multi-agent"
-    else:
-        runner = build_agent(system_prompt)
-        mode = "single"
-
-    result, num_reflections, final_score = await _run_with_reflection(
-        runner, task, memory_context, is_multi=MULTI_AGENT_MODE
+    result, num_reflections, final_score, ledger = await _run_with_reflection(
+        task, system_prompt, memory_context, is_multi=MULTI_AGENT_MODE
     )
     latency_ms = int((time.monotonic() - t0) * 1000)
 
     # Confidence gate
     confidence_gated = False
     if result.confidence < CONFIDENCE_GATE:
-        console.print(f"[red]Confidence {result.confidence:.0%} below gate — returning low-confidence notice[/red]")
+        console.print(f"[red]Confidence {result.confidence:.0%} below gate — low-confidence notice[/red]")
         result.answer = (
             f"[Low confidence: {result.confidence:.0%}] "
-            f"The agent could not produce a reliable answer. "
             f"Partial reasoning: {result.reasoning[:200]}"
         )
         confidence_gated = True
+
+    # Final grounding ratio (from last attempt's ledger)
+    final_grounding = await check_grounding(task, result.answer, ledger)
 
     meta = RunMeta(
         latency_ms=latency_ms,
         reflections=num_reflections,
         final_score=final_score,
+        grounding_ratio=final_grounding.grounding_ratio,
+        validator_passed=(final_grounding.verdict != "fail"),
         confidence_gated=confidence_gated,
-        mode=mode,
+        self_critiqued=SELF_CRITIQUE_ENABLED,
+        mode="multi-agent" if MULTI_AGENT_MODE else "single",
     )
 
     memory.store(task, result.answer, final_score, result.tools_used)
@@ -341,9 +404,9 @@ async def main(task: str, return_meta: bool = False):
     console.print(Panel(
         f"[bold green]Answer[/bold green]\n\n{result.answer}\n\n"
         f"[dim]Confidence: {result.confidence:.0%} | "
+        f"Grounding: {final_grounding.grounding_ratio:.0%} | "
         f"Tools: {', '.join(result.tools_used) or 'none'} | "
-        f"Latency: {latency_ms}ms | Reflections: {num_reflections} | "
-        f"Mode: {mode}[/dim]",
+        f"Latency: {latency_ms}ms | Reflections: {num_reflections}[/dim]",
         border_style="green",
     ))
 
