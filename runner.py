@@ -10,12 +10,13 @@ PIPELINE (python runner.py):
   Phase 2c  GitHub      → existing implementations (50+ stars/forks)
   Phase 3   Judge tools → shortlist + live search
   Phase 4   Synthesize  → architecture plan + 24h time budget
-  Phase 5   Scaffold    → writes agent/tools.py, prompts/system_v1.0.yaml, agent/eval.py
+  Phase 5   Scaffold    → tools, specialists, prompt, eval cases, pytest tests, diagram
 
 THEN YOU:
   Fill in   agent/tools.py  TODO blocks
+  Test      make test                             (pytest — run after filling tools)
   Run       python agent/agent.py --input "..."   (Phoenix traces → localhost:6006)
-  Demo      python agent/ui.py                    (Gradio UI    → localhost:7860)
+  Demo      python agent/ui.py                    (Gradio streaming UI → localhost:7860)
   Eval      python agent/eval.py                  (DeepEval scores)
   A/B       python agent/eval.py --ab 1.0 2.0     (compare prompt versions)
   Submit    python runner.py --self-eval           (AI judge simulation)
@@ -121,20 +122,26 @@ def run_full_pipeline(question: str) -> dict:
         f"[dim](budget: {RESEARCH_TIME_BUDGET_MINUTES} min)[/dim]\n\n"
 
         "[bold cyan]What was generated:[/bold cyan]\n"
-        "  [cyan]agent/tools.py[/cyan]            ← fill in TODO blocks\n"
-        "  [cyan]prompts/system_v1.0.yaml[/cyan]  ← tweak after first test run\n"
-        "  [cyan]agent/eval.py[/cyan]              ← auto-populated with 5 test cases\n\n"
+        "  [cyan]agent/tools.py[/cyan]         ← fill in # TODO blocks\n"
+        "  [cyan]agent/specialists.py[/cyan]   ← multi-agent specialist definitions\n"
+        "  [cyan]prompts/system_v1.0.yaml[/cyan]\n"
+        "  [cyan]agent/eval.py[/cyan]          ← 5 generated DeepEval test cases\n"
+        "  [cyan]tests/test_tools.py[/cyan]    ← pytest per-tool tests\n"
+        "  [cyan]tests/test_agent.py[/cyan]    ← e2e integration tests\n"
+        "  [cyan]docs/architecture.md[/cyan]   ← Mermaid diagram\n\n"
 
         "[bold yellow]Build loop:[/bold yellow]\n"
         "  1. Fill in [cyan]agent/tools.py[/cyan] TODO blocks\n"
-        "  2. [cyan]python agent/agent.py --input 'test'[/cyan]   — run agent\n"
-        "  3. [cyan]http://localhost:6006[/cyan]                  — Phoenix traces\n"
-        "  4. [cyan]python agent/eval.py[/cyan]                   — DeepEval scores\n"
-        "  5. Bump prompt → [cyan]prompts/changelog.yaml[/cyan]   — track metrics\n"
-        "  6. [cyan]python agent/eval.py --ab 1.0 2.0[/cyan]      — A/B compare\n"
-        "  7. [cyan]python agent/ui.py[/cyan]                     — Gradio demo\n"
-        "  8. [cyan]python runner.py --self-eval[/cyan]            — judge prep\n"
-        "  9. Submit\n\n"
+        "  2. [cyan]make test[/cyan]                              — pytest (target: all green)\n"
+        "  3. [cyan]make agent TASK='test input'[/cyan]           — run agent\n"
+        "  4. [cyan]http://localhost:6006[/cyan]                  — Phoenix traces\n"
+        "  5. [cyan]make eval[/cyan]                              — DeepEval scores\n"
+        "  6. Bump prompt → [cyan]prompts/changelog.yaml[/cyan]\n"
+        "  7. [cyan]make ab VA=1.0 VB=2.0[/cyan]                 — A/B compare\n"
+        "  8. [cyan]make ui[/cyan]                                — Gradio streaming demo\n"
+        "  9. [cyan]make diagram[/cyan]                          — regenerate architecture diagram\n"
+        " 10. [cyan]make self-eval[/cyan]                         — AI judge simulation\n"
+        " 11. Submit\n\n"
 
         f"[dim]Remaining time budget: {remaining:.1f} min[/dim]",
         border_style="green",
