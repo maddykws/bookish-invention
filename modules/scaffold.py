@@ -1,0 +1,199 @@
+"""
+Scaffold Module
+Generates problem-specific agent code from the architecture plan.
+Writes to agent/tools.py, agent/eval.py, and prompts/system_v1.0.yaml.
+Everything else (Phoenix, Langfuse, Reflexion) is pre-built and static.
+"""
+
+import os
+import json
+import yaml
+import anthropic
+from datetime import datetime
+from pathlib import Path
+from rich.console import Console
+from rich.panel import Panel
+
+console = Console()
+
+REPO_ROOT = Path(__file__).parent.parent
+AGENT_DIR = REPO_ROOT / "agent"
+PROMPTS_DIR = REPO_ROOT / "prompts"
+
+TOOLS_PROMPT = """You are a senior Python AI engineer. Based on the problem decomposition and architecture plan below,
+generate the tool stubs for a PydanticAI agent.
+
+## Problem Decomposition
+{decomposition}
+
+## Architecture Plan
+{architecture_plan}
+
+Generate Python code for agent/tools.py. Requirements:
+1. Each tool must have a Pydantic input model and return a Pydantic model (not raw dicts)
+2. Generate 3-5 tools that together solve the problem
+3. Add a # TODO: implement comment inside each tool body — the human will fill this in
+4. Import only: pydantic, pydantic_ai, typing, and standard library
+5. Include a TOOLS list at the bottom: list of all tool functions (for registration)
+6. Keep tool names snake_case, descriptive, and specific to the problem
+
+Return ONLY valid Python code, no markdown fences, no explanation.
+"""
+
+SYSTEM_PROMPT_PROMPT = """You are a prompt engineer for AI agents. Based on the problem below,
+write a system prompt (v1.0) for a PydanticAI agent.
+
+## Problem Decomposition
+{decomposition}
+
+## Architecture Plan
+{architecture_plan}
+
+Write a system prompt that:
+1. Clearly states what the agent is and its goal
+2. Specifies the reasoning approach (ReAct: think step by step, use tools, observe, repeat)
+3. Lists the available tools and when to use each
+4. Defines what a complete, correct answer looks like
+5. Includes instructions for handling failure / uncertainty
+6. Is concise — under 400 words
+
+Return ONLY the system prompt text, no markdown, no explanation.
+"""
+
+EVAL_CASES_PROMPT = """You are a QA engineer. Based on the problem below, generate DeepEval test cases.
+
+## Problem Decomposition
+{decomposition}
+
+## Architecture Plan
+{architecture_plan}
+
+Generate 5 test cases as a Python list of dicts with keys:
+- "input": the query/task given to the agent
+- "expected_output": what a correct answer looks like (can be partial/descriptive)
+- "context": any relevant context the agent should use (can be empty string)
+- "label": short name for this test case
+
+Cover: 3 normal cases, 1 edge case, 1 adversarial/tricky case.
+
+Return ONLY a valid Python list literal (no markdown, no variable assignment, no explanation).
+Example format:
+[
+  {{"input": "...", "expected_output": "...", "context": "...", "label": "basic_case"}},
+  ...
+]
+"""
+
+
+def _call_claude(prompt: str) -> str:
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=3000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text.strip()
+
+
+def _strip_fences(code: str) -> str:
+    if code.startswith("```"):
+        lines = code.split("\n")
+        lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines)
+    return code
+
+
+def generate_scaffold(decomposition: dict, architecture_plan: str) -> None:
+    console.print(Panel(
+        "[bold cyan]Step 5: Generating Agent Scaffold[/bold cyan]\n"
+        "[dim]Writing tools.py, eval.py, and prompts/system_v1.0.yaml[/dim]"
+    ))
+
+    AGENT_DIR.mkdir(exist_ok=True)
+    PROMPTS_DIR.mkdir(exist_ok=True)
+
+    decomp_str = json.dumps(decomposition, indent=2)
+
+    console.print("[yellow]Generating tool stubs...[/yellow]")
+    tools_code = _strip_fences(_call_claude(
+        TOOLS_PROMPT.format(decomposition=decomp_str, architecture_plan=architecture_plan)
+    ))
+    _write_tools(tools_code)
+
+    console.print("[yellow]Generating system prompt v1.0...[/yellow]")
+    system_prompt_text = _call_claude(
+        SYSTEM_PROMPT_PROMPT.format(decomposition=decomp_str, architecture_plan=architecture_plan)
+    )
+    _write_system_prompt(system_prompt_text)
+
+    console.print("[yellow]Generating eval test cases...[/yellow]")
+    eval_cases_raw = _strip_fences(_call_claude(
+        EVAL_CASES_PROMPT.format(decomposition=decomp_str, architecture_plan=architecture_plan)
+    ))
+    _write_eval_cases(eval_cases_raw)
+
+    console.print("\n[bold green]Scaffold complete. Files written:[/bold green]")
+    console.print("  [cyan]agent/tools.py[/cyan]     ← fill in the TODO bodies")
+    console.print("  [cyan]agent/eval.py[/cyan]      ← run after building to get metrics")
+    console.print("  [cyan]prompts/system_v1.0.yaml[/cyan] ← tweak after first test run\n")
+
+
+def _write_tools(tools_code: str) -> None:
+    path = AGENT_DIR / "tools.py"
+    header = '"""\nTool stubs — generated by scaffold.py.\nFill in each # TODO block with the actual implementation.\n"""\n\n'
+    path.write_text(header + tools_code)
+
+
+def _write_system_prompt(prompt_text: str) -> None:
+    data = {
+        "version": "1.0",
+        "model": "claude-sonnet-4-6",
+        "created": datetime.now().strftime("%Y-%m-%d"),
+        "changed_from": None,
+        "reason": "Initial generated prompt from question decomposition",
+        "metric_before": None,
+        "metric_after": None,
+        "prompt": prompt_text,
+    }
+    path = PROMPTS_DIR / "system_v1.0.yaml"
+    with open(path, "w") as f:
+        yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+    changelog_path = PROMPTS_DIR / "changelog.yaml"
+    if not changelog_path.exists():
+        changelog = {
+            "versions": [
+                {
+                    "version": "1.0",
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "reason": "Initial generated prompt",
+                    "task_completion": None,
+                    "answer_relevancy": None,
+                }
+            ]
+        }
+        with open(changelog_path, "w") as f:
+            yaml.dump(changelog, f, allow_unicode=True, default_flow_style=False)
+
+
+def _write_eval_cases(eval_cases_raw: str) -> None:
+    eval_path = AGENT_DIR / "eval.py"
+    # Read the static eval template and inject the generated test cases
+    template_path = AGENT_DIR / "eval.py"
+    # eval.py is a static file — we patch the TEST_CASES constant in it
+    if template_path.exists():
+        content = template_path.read_text()
+        marker = "# GENERATED_TEST_CASES"
+        if marker in content:
+            content = content.replace(
+                marker,
+                f"# GENERATED_TEST_CASES\nTEST_CASES_DATA = {eval_cases_raw}"
+            )
+            template_path.write_text(content)
+    else:
+        # eval.py not yet written — scaffold will be injected when eval.py is created
+        (AGENT_DIR / "_pending_test_cases.py").write_text(
+            f"TEST_CASES_DATA = {eval_cases_raw}\n"
+        )

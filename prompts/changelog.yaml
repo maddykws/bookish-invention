@@ -1,0 +1,21 @@
+# Prompt version history
+# After each iteration: update metric_after, bump version, document reason
+# This is what you show the AI judge when asked "what did you iterate on?"
+
+versions:
+  - version: "1.0"
+    date: "2026-05-01"
+    reason: "Initial generated prompt from question decomposition"
+    task_completion: null   # fill after running eval.py
+    answer_relevancy: null  # fill after running eval.py
+    hallucination: null     # fill after running eval.py
+    notes: ""
+
+# Template for new versions — copy below when bumping:
+# - version: "1.1"
+#   date: "2026-05-01"
+#   reason: "Tightened tool usage instructions after seeing hallucinated tool params in traces"
+#   task_completion: 0.87
+#   answer_relevancy: 0.91
+#   hallucination: 0.08
+#   notes: "Added explicit output schema requirement to prevent malformed tool calls"
