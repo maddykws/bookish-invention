@@ -4,27 +4,27 @@ HackerRank Orchestrate — End-to-End Pipeline
 Question drops → this pipeline runs → you build → agent solves problem → you win.
 
 PIPELINE (python runner.py):
-  Phase 1  Decompose question into structured search targets
-  Phase 2a ArXiv → cutting-edge research papers
-  Phase 2b GitHub → existing implementations (50+ stars/forks)
-  Phase 3  AI judge tools shortlist (pre-researched) + live search
-  Phase 4  Synthesize → architecture plan + 24h time budget
-  Phase 5  Scaffold → generates agent/tools.py, prompts/system_v1.0.yaml, agent/eval.py
+  Phase 1   Decompose   → domain, agent type, success criteria, search queries
+  Phase 2a  ArXiv       → cutting-edge papers (2022–2026, recency signal)
+  Phase 2b  S2          → high-impact papers  (2020–2026, citation signal ≥50)
+  Phase 2c  GitHub      → existing implementations (50+ stars/forks)
+  Phase 3   Judge tools → shortlist + live search
+  Phase 4   Synthesize  → architecture plan + 24h time budget
+  Phase 5   Scaffold    → writes agent/tools.py, prompts/system_v1.0.yaml, agent/eval.py
 
 THEN YOU:
-  Fill in  agent/tools.py  TODO blocks (the actual implementation)
-  Iterate  prompts/        bump version when you change the prompt
-  Eval     python agent/eval.py          → get task completion %, relevancy score
-  Run      python agent/agent.py --input "..."
-  Submit   python runner.py --self-eval  → AI judge simulation
+  Fill in   agent/tools.py  TODO blocks
+  Run       python agent/agent.py --input "..."   (Phoenix traces → localhost:6006)
+  Demo      python agent/ui.py                    (Gradio UI    → localhost:7860)
+  Eval      python agent/eval.py                  (DeepEval scores)
+  A/B       python agent/eval.py --ab 1.0 2.0     (compare prompt versions)
+  Submit    python runner.py --self-eval           (AI judge simulation)
 
 MODES:
-  python runner.py                          # Full pipeline (use on question drop)
+  python runner.py                          # Full pipeline
   python runner.py --judge-tools-only       # Show pre-researched judge tools
-  python runner.py --self-eval              # AI judge simulation (run before submitting)
+  python runner.py --self-eval              # AI judge simulation
   python runner.py --checklist              # Pre-submission checklist
-  python agent/agent.py --input "..."       # Run the agent directly
-  python agent/eval.py                      # Run DeepEval evaluation
 """
 
 import os
@@ -40,6 +40,7 @@ load_dotenv()
 
 from modules.decompose import decompose_question
 from modules.arxiv_search import search_arxiv
+from modules.semantic_scholar import search_semantic_scholar
 from modules.github_search import search_github_implementations, search_github_judge_tools
 from modules.judge_tools import display_judge_tools_shortlist, get_judge_tool_github_queries, PRERESEARCHED_JUDGE_TOOLS
 from modules.synthesize import synthesize
@@ -84,25 +85,31 @@ def run_full_pipeline(question: str) -> dict:
     console.print(Rule("[bold]PHASE 1 / 5 — Decompose Question[/bold]"))
     decomposition = decompose_question(question)
 
-    # ── Phase 2a: ArXiv ───────────────────────────────────────────────────────
-    console.print(Rule("[bold]PHASE 2a / 5 — ArXiv Research[/bold]"))
+    # ── Phase 2a: ArXiv (2022–2026, recency signal) ───────────────────────────
+    console.print(Rule("[bold]PHASE 2a / 6 — ArXiv (2022–2026)[/bold]"))
     arxiv_papers = search_arxiv(decomposition["arxiv_queries"])
 
-    # ── Phase 2b: GitHub implementations ─────────────────────────────────────
-    console.print(Rule("[bold]PHASE 2b / 5 — GitHub Implementations (50+ stars/forks)[/bold]"))
+    # ── Phase 2b: Semantic Scholar (2020–2026, citation signal) ───────────────
+    console.print(Rule("[bold]PHASE 2b / 6 — Semantic Scholar (2020–2026, ≥50 citations)[/bold]"))
+    s2_papers = search_semantic_scholar(decomposition["arxiv_queries"])
+
+    all_papers = arxiv_papers + s2_papers
+
+    # ── Phase 2c: GitHub implementations ─────────────────────────────────────
+    console.print(Rule("[bold]PHASE 2c / 6 — GitHub Implementations (50+ stars/forks)[/bold]"))
     github_repos = search_github_implementations(decomposition["github_queries"])
 
     # ── Phase 3: AI judge tools ───────────────────────────────────────────────
-    console.print(Rule("[bold]PHASE 3 / 5 — AI Judge & Eval Tools[/bold]"))
+    console.print(Rule("[bold]PHASE 3 / 6 — AI Judge & Eval Tools[/bold]"))
     display_judge_tools_shortlist()
     live_judge_repos = search_github_judge_tools(get_judge_tool_github_queries())
 
     # ── Phase 4: Synthesize ───────────────────────────────────────────────────
-    console.print(Rule("[bold]PHASE 4 / 5 — Synthesize → Architecture Plan[/bold]"))
-    architecture_plan = synthesize(decomposition, arxiv_papers, github_repos, PRERESEARCHED_JUDGE_TOOLS)
+    console.print(Rule("[bold]PHASE 4 / 6 — Synthesize → Architecture Plan[/bold]"))
+    architecture_plan = synthesize(decomposition, all_papers, github_repos, PRERESEARCHED_JUDGE_TOOLS)
 
     # ── Phase 5: Scaffold ─────────────────────────────────────────────────────
-    console.print(Rule("[bold]PHASE 5 / 5 — Generate Agent Scaffold[/bold]"))
+    console.print(Rule("[bold]PHASE 5 / 6 — Generate Agent Scaffold[/bold]"))
     generate_scaffold(decomposition, architecture_plan)
 
     elapsed = (time.time() - start) / 60
@@ -116,27 +123,31 @@ def run_full_pipeline(question: str) -> dict:
         "[bold cyan]What was generated:[/bold cyan]\n"
         "  [cyan]agent/tools.py[/cyan]            ← fill in TODO blocks\n"
         "  [cyan]prompts/system_v1.0.yaml[/cyan]  ← tweak after first test run\n"
-        "  [cyan]agent/eval.py[/cyan]              ← auto-populated with test cases\n\n"
+        "  [cyan]agent/eval.py[/cyan]              ← auto-populated with 5 test cases\n\n"
 
-        "[bold yellow]Your build loop:[/bold yellow]\n"
+        "[bold yellow]Build loop:[/bold yellow]\n"
         "  1. Fill in [cyan]agent/tools.py[/cyan] TODO blocks\n"
-        "  2. Run  [cyan]python agent/agent.py --input 'test input'[/cyan]\n"
-        "  3. Check Phoenix traces → http://localhost:6006\n"
-        "  4. Run  [cyan]python agent/eval.py[/cyan] → get scores\n"
-        "  5. Bump prompt version if score < 0.7  →  update [cyan]prompts/changelog.yaml[/cyan]\n"
-        "  6. Run  [cyan]python runner.py --self-eval[/cyan] → judge prep\n"
-        "  7. Submit\n\n"
+        "  2. [cyan]python agent/agent.py --input 'test'[/cyan]   — run agent\n"
+        "  3. [cyan]http://localhost:6006[/cyan]                  — Phoenix traces\n"
+        "  4. [cyan]python agent/eval.py[/cyan]                   — DeepEval scores\n"
+        "  5. Bump prompt → [cyan]prompts/changelog.yaml[/cyan]   — track metrics\n"
+        "  6. [cyan]python agent/eval.py --ab 1.0 2.0[/cyan]      — A/B compare\n"
+        "  7. [cyan]python agent/ui.py[/cyan]                     — Gradio demo\n"
+        "  8. [cyan]python runner.py --self-eval[/cyan]            — judge prep\n"
+        "  9. Submit\n\n"
 
         f"[dim]Remaining time budget: {remaining:.1f} min[/dim]",
         border_style="green",
     ))
 
     return {
-        "question": question,
-        "decomposition": decomposition,
-        "arxiv_papers": arxiv_papers,
-        "github_repos": github_repos,
-        "live_judge_repos": live_judge_repos,
+        "question":          question,
+        "decomposition":     decomposition,
+        "arxiv_papers":      arxiv_papers,
+        "s2_papers":         s2_papers,
+        "all_papers":        all_papers,
+        "github_repos":      github_repos,
+        "live_judge_repos":  live_judge_repos,
         "architecture_plan": architecture_plan,
     }
 

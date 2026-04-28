@@ -18,3 +18,10 @@ langfuse>=2.0.0
 
 # Evaluation
 deepeval>=1.0.0
+
+# Demo UI
+gradio>=4.0.0
+
+# Agent memory
+chromadb>=0.5.0
+sentence-transformers>=3.0.0

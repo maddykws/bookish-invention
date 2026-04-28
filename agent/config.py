@@ -13,7 +13,10 @@ MODEL = "claude-sonnet-4-6"
 
 # ── Reflexion ─────────────────────────────────────────────────────────────────
 MAX_REFLECTIONS = 3          # max self-correction loops before accepting best result
-REFLECTION_THRESHOLD = 0.75  # DeepEval score below this triggers a reflection loop
+REFLECTION_THRESHOLD = 0.75  # score below this triggers a reflection loop
+
+# ── Confidence gate ───────────────────────────────────────────────────────────
+CONFIDENCE_GATE = 0.35       # refuse to answer if confidence stays below this after all reflections
 
 # ── Observability (Arize Phoenix) ─────────────────────────────────────────────
 PHOENIX_ENABLED = True
