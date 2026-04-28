@@ -70,9 +70,7 @@ Return ONLY the JSON.
 
 
 async def validate(task: str, answer: str, reasoning: str, confidence: float) -> ValidationResult:
-    import anthropic
-    import json
-    from agent.config import MODEL, VALIDATOR_ENABLED
+    from agent.config import VALIDATOR_ENABLED
 
     if not VALIDATOR_ENABLED:
         return ValidationResult(
@@ -84,32 +82,12 @@ async def validate(task: str, answer: str, reasoning: str, confidence: float) ->
             critique="Validator disabled.",
         )
 
-    console.print("\n  [dim]Running meta-validator...[/dim]")
+    console.print("\n  [dim]Running meta-validator (multi-LLM panel)...[/dim]")
 
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=600,
-        messages=[{
-            "role": "user",
-            "content": VALIDATOR_PROMPT.format(
-                task=task,
-                answer=answer,
-                reasoning=reasoning,
-                confidence=confidence,
-            ),
-        }],
-    )
-
-    raw = resp.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip().rstrip("```")
+    from agent.judge import validate_with_panel
+    data = await validate_with_panel(task, answer, reasoning, confidence)
 
     try:
-        data = json.loads(raw)
         result = ValidationResult(**data)
     except Exception:
         result = ValidationResult(

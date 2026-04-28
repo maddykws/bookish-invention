@@ -180,18 +180,14 @@ def build_agent(system_prompt: str, ledger: EvidenceLedger) -> Agent:
 # ── Scoring (for reflexion) ───────────────────────────────────────────────────
 
 async def _score(answer: str, task: str) -> tuple[float, str]:
+    """Score via the multi-LLM judge panel to eliminate same-model bias."""
     try:
-        import anthropic as anth
-        client = anth.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        resp = client.messages.create(
-            model=MODEL, max_tokens=150,
-            messages=[{"role": "user", "content": (
-                f"Task: {task}\nAnswer: {answer}\n\n"
-                "Rate 0.0–1.0. Reply ONLY: <score>|<reason>."
-            )}],
+        from agent.judge import score_with_panel
+        ensemble, result = await score_with_panel(task, answer)
+        reason = "; ".join(
+            f"{s.model.split('/')[-1]}:{s.score:.2f}" for s in result.scores if not s.skipped
         )
-        parts = resp.content[0].text.strip().split("|", 1)
-        return float(parts[0].strip()), parts[1].strip() if len(parts) > 1 else ""
+        return ensemble, reason
     except Exception:
         return 0.5, "score unavailable"
 

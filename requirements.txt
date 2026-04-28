@@ -25,3 +25,6 @@ gradio>=4.0.0
 # Agent memory
 chromadb>=0.5.0
 sentence-transformers>=3.0.0
+
+# Multi-LLM judge panel (eliminates same-model bias)
+litellm>=1.0.0

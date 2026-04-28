@@ -50,6 +50,16 @@ PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 ACTIVE_PROMPT_VERSION = "1.0"
 LANGFUSE_ENABLED = bool(os.getenv("LANGFUSE_SECRET_KEY"))
 
+# ── Multi-LLM judge panel (eliminates same-model bias) ────────────────────────
+# Models are tried in order; any without an API key are silently skipped.
+# Claude is the automatic fallback if all external judges are unavailable.
+JUDGE_MODELS = [
+    "openai/gpt-4o",               # needs OPENAI_API_KEY
+    "google/gemini-flash",         # needs GOOGLE_API_KEY
+    "groq/llama-3.3-70b-versatile",# needs GROQ_API_KEY  (free tier available)
+]
+JUDGE_ENSEMBLE = "average"         # "average" | "majority" | "conservative"
+
 # ── Evaluation ────────────────────────────────────────────────────────────────
 EVAL_PASS_THRESHOLD = 0.7
 EVAL_MODEL = "claude-sonnet-4-6"
