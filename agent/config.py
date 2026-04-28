@@ -50,6 +50,9 @@ PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 ACTIVE_PROMPT_VERSION = "1.0"
 LANGFUSE_ENABLED = bool(os.getenv("LANGFUSE_SECRET_KEY"))
 
+# ── Final output contract ─────────────────────────────────────────────────────
+CONTRACT_ENABLED = True   # True → every answer must pass the output contract before delivery
+
 # ── Multi-LLM judge panel (eliminates same-model bias) ────────────────────────
 # Models are tried in order; any without an API key are silently skipped.
 # Claude is the automatic fallback if all external judges are unavailable.

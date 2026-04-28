@@ -54,6 +54,7 @@ from agent.config import (
     GROUNDING_ENABLED, GROUNDING_FAIL_THRESHOLD,
     SELF_CRITIQUE_ENABLED,
     VALIDATOR_ENABLED,
+    CONTRACT_ENABLED,
     MULTI_AGENT_MODE,
     HUMAN_IN_THE_LOOP, HITL_TOOLS,
     PHOENIX_ENABLED, PHOENIX_PORT,
@@ -64,6 +65,7 @@ from agent.reasoning import build_reasoning_plan, plan_to_context, ReasoningPlan
 from agent.grounding import EvidenceLedger, check_grounding, grounding_feedback
 from agent.critique import self_critique
 from agent.validator import validate
+from agent.contract import enforce_contract, extract_sources, FinalOutput
 
 console = Console()
 LOGS_DIR = Path(__file__).parent.parent / "logs"
@@ -394,21 +396,50 @@ async def main(task: str, return_meta: bool = False):
         mode="multi-agent" if MULTI_AGENT_MODE else "single",
     )
 
+    # ── Final Output Contract ─────────────────────────────────────────────────
+    console.print("\n  [dim]Enforcing output contract...[/dim]")
+    contract_result = enforce_contract(
+        answer=result.answer,
+        confidence=result.confidence,
+        reasoning=result.reasoning,
+        tools_used=result.tools_used,
+        grounding_ratio=final_grounding.grounding_ratio,
+        grounding_verdict=final_grounding.verdict,
+        sources=extract_sources(ledger),
+        reflections=num_reflections,
+        latency_ms=latency_ms,
+        model=MODEL,
+    )
+
+    if not contract_result.passed:
+        # Surface violations clearly — do not silently swallow them
+        violation_lines = "\n".join(
+            f"  [{v.field}] {v.rule}" for v in contract_result.violations
+        )
+        console.print(f"[red]Output contract violations:\n{violation_lines}[/red]")
+
+    final_output: FinalOutput = contract_result.output
+    # Sync any auto-repairs back to result for logging
+    result.answer     = final_output.answer
+    result.confidence = final_output.confidence
+
     memory.store(task, result.answer, final_score, result.tools_used)
     _write_log(task, result, meta)
 
     console.print(Panel(
-        f"[bold green]Answer[/bold green]\n\n{result.answer}\n\n"
-        f"[dim]Confidence: {result.confidence:.0%} | "
-        f"Grounding: {final_grounding.grounding_ratio:.0%} | "
-        f"Tools: {', '.join(result.tools_used) or 'none'} | "
-        f"Latency: {latency_ms}ms | Reflections: {num_reflections}[/dim]",
-        border_style="green",
+        f"[bold green]Answer[/bold green]\n\n{final_output.answer}\n\n"
+        f"[dim]Confidence: {final_output.confidence:.0%} | "
+        f"Grounding: {final_output.grounding_ratio:.0%} ({final_output.grounding_verdict}) | "
+        f"Sources: {len(final_output.sources)} | "
+        f"Tools: {', '.join(final_output.tools_used) or 'none'} | "
+        f"Latency: {latency_ms}ms | Reflections: {num_reflections} | "
+        f"Contract: {'✓' if contract_result.passed else '✗'}[/dim]",
+        border_style="green" if contract_result.passed else "yellow",
     ))
 
     if return_meta:
-        return result, meta.model_dump()
-    return result
+        return final_output, meta.model_dump()
+    return final_output
 
 
 if __name__ == "__main__":
