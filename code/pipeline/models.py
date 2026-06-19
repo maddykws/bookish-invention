@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 
 # ── Input models ──────────────────────────────────────────────────────────────
@@ -119,6 +119,59 @@ class PipelineMetrics(BaseModel):
     model_used: str = ""
 
 
+# ── Authoritative allowed-value vocabularies (from official spec) ─────────────
+
+# The 14 sanctioned risk flags. This is the AUTHORITY — not the 20-sample subset.
+# model_consensus_conflict is INTERNAL ONLY (remapped before output), never here.
+VALID_RISK_FLAGS: frozenset[str] = frozenset({
+    "none",
+    "blurry_image",
+    "cropped_or_obstructed",
+    "low_light_or_glare",
+    "wrong_angle",
+    "wrong_object",
+    "wrong_object_part",
+    "damage_not_visible",
+    "claim_mismatch",
+    "possible_manipulation",
+    "non_original_image",
+    "text_instruction_present",
+    "user_history_risk",
+    "manual_review_required",
+})
+
+# Per-object allowed object_part values. "unknown" is valid for every object.
+OBJECT_PART_VOCAB: dict[str, frozenset[str]] = {
+    "car": frozenset({
+        "front_bumper", "rear_bumper", "door", "hood", "windshield",
+        "side_mirror", "headlight", "taillight", "fender", "quarter_panel",
+        "body", "unknown",
+    }),
+    "laptop": frozenset({
+        "screen", "keyboard", "trackpad", "hinge", "lid", "corner",
+        "port", "base", "body", "unknown",
+    }),
+    "package": frozenset({
+        "box", "package_corner", "package_side", "seal", "label",
+        "contents", "item", "unknown",
+    }),
+}
+
+ISSUE_TYPE_VALUES: frozenset[str] = frozenset({
+    "dent", "scratch", "crack", "glass_shatter", "broken_part",
+    "missing_part", "torn_packaging", "crushed_packaging",
+    "water_damage", "stain", "none", "unknown",
+})
+
+CLAIM_STATUS_VALUES: frozenset[str] = frozenset({
+    "supported", "contradicted", "not_enough_information",
+})
+
+SEVERITY_VALUES: frozenset[str] = frozenset({
+    "none", "low", "medium", "high", "unknown",
+})
+
+
 # ── Output model ──────────────────────────────────────────────────────────────
 
 class ClaimOutput(BaseModel):
@@ -136,7 +189,7 @@ class ClaimOutput(BaseModel):
         "missing_part", "torn_packaging", "crushed_packaging",
         "water_damage", "stain", "none", "unknown"
     ]
-    object_part: str
+    object_part: str             # validated against OBJECT_PART_VOCAB[claim_object]
     claim_status: Literal["supported", "contradicted", "not_enough_information"]
     claim_status_justification: str
     supporting_image_ids: str    # semicolon-separated or "none"
@@ -146,29 +199,31 @@ class ClaimOutput(BaseModel):
     @field_validator("risk_flags")
     @classmethod
     def validate_risk_flags(cls, v: str) -> str:
-        valid = {
-            "blurry_image", "cropped_or_obstructed", "claim_mismatch",
-            "user_history_risk", "manual_review_required", "wrong_object",
-            "wrong_angle", "damage_not_visible", "non_original_image",
-            "text_instruction_present", "none",
-        }
         flags = [f.strip() for f in v.split(";") if f.strip()]
         for flag in flags:
-            if flag not in valid:
-                raise ValueError(f"Invalid risk flag: {flag!r}")
+            if flag not in VALID_RISK_FLAGS:
+                raise ValueError(
+                    f"Invalid risk flag: {flag!r} (not in the 14 official flags)"
+                )
         return v
+
+    @model_validator(mode="after")
+    def validate_object_part(self) -> "ClaimOutput":
+        allowed = OBJECT_PART_VOCAB.get(self.claim_object)
+        if allowed is not None and self.object_part not in allowed:
+            raise ValueError(
+                f"object_part {self.object_part!r} is not valid for "
+                f"claim_object {self.claim_object!r}; allowed: {sorted(allowed)}"
+            )
+        return self
 
 
 # ── Validator helper ──────────────────────────────────────────────────────────
 
 class ClaimRowValidator:
     VALID_OBJECTS: frozenset[str] = frozenset({"car", "laptop", "package"})
-    VALID_RISK_FLAGS: frozenset[str] = frozenset({
-        "blurry_image", "cropped_or_obstructed", "claim_mismatch",
-        "user_history_risk", "manual_review_required", "wrong_object",
-        "wrong_angle", "damage_not_visible", "non_original_image",
-        "text_instruction_present", "none",
-    })
+    # Single source of truth — the 14 official flags (defined above).
+    VALID_RISK_FLAGS: frozenset[str] = VALID_RISK_FLAGS
     # Internal-only flags → remap before writing output.csv
     INTERNAL_FLAG_MAP: dict[str, str] = {
         "model_consensus_conflict": "manual_review_required",

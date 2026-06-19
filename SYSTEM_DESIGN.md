@@ -2120,14 +2120,62 @@ From `evidence_requirements.csv` — loaded at startup, checked locally in Stage
 | `claim_object` | string | car, laptop, package (echoed verbatim) |
 | `evidence_standard_met` | boolean | true, false |
 | `evidence_standard_met_reason` | string | Free text explanation |
-| `risk_flags` | string | Semicolon-separated list |
+| `risk_flags` | string | Semicolon-separated; one or more of the **14 official flags** (see §11.2), or `none` |
 | `issue_type` | string | dent, scratch, crack, glass_shatter, broken_part, missing_part, torn_packaging, crushed_packaging, water_damage, stain, none, unknown |
-| `object_part` | string | Observed vocab — car: rear_bumper, front_bumper, windshield, side_mirror, headlight, door, hood · laptop: screen, keyboard, trackpad, hinge, corner · package: package_corner, package_side, seal, contents · fallback: unknown |
+| `object_part` | string | **Object-specific allowed list (see §11.2)** — validated against `OBJECT_PART_VOCAB[claim_object]`; `unknown` valid for all |
 | `claim_status` | string | supported, contradicted, not_enough_information |
-| `claim_status_justification` | string | Evidence-grounded explanation |
+| `claim_status_justification` | string | Evidence-grounded explanation; cite image IDs when helpful (§3.6) |
 | `supporting_image_ids` | string | Semicolon-separated image IDs or "none" |
-| `valid_image` | boolean | Single bool: overall image set usable for evaluation |
+| `valid_image` | boolean | Single bool: overall image set usable for automated review |
 | `severity` | string | none, low, medium, high, unknown |
+
+### 11.2 Authoritative Allowed Values (from official spec — THE authority)
+
+These lists are the authority, NOT the 20-sample subset. Earlier drafts derived
+vocab from the samples and under-counted (only 11 risk flags, partial part
+lists). The validators in `code/pipeline/models.py` encode exactly these.
+
+**`claim_status` (3):** `supported`, `contradicted`, `not_enough_information`
+
+**`issue_type` (12):** `dent`, `scratch`, `crack`, `glass_shatter`, `broken_part`,
+`missing_part`, `torn_packaging`, `crushed_packaging`, `water_damage`, `stain`,
+`none`, `unknown`
+
+**`severity` (5):** `none`, `low`, `medium`, `high`, `unknown`
+
+**`risk_flags` (14 official):** `none`, `blurry_image`, `cropped_or_obstructed`,
+`low_light_or_glare`, `wrong_angle`, `wrong_object`, `wrong_object_part`,
+`damage_not_visible`, `claim_mismatch`, `possible_manipulation`,
+`non_original_image`, `text_instruction_present`, `user_history_risk`,
+`manual_review_required`
+> Three flags were **added** vs the sample-derived set:
+> `low_light_or_glare`, `wrong_object_part`, `possible_manipulation`.
+> `possible_manipulation` is now the first-class flag for suspected tampering
+> (FFT/EXIF signals) — previously it had nowhere to go but `non_original_image`.
+> `model_consensus_conflict` remains INTERNAL ONLY → remapped to
+> `manual_review_required` before output; it is correctly absent from the 14.
+
+**`object_part` — per `claim_object` (`unknown` valid for all three):**
+```
+car (12):     front_bumper, rear_bumper, door, hood, windshield, side_mirror,
+              headlight, taillight, fender, quarter_panel, body, unknown
+laptop (10):  screen, keyboard, trackpad, hinge, lid, corner, port, base,
+              body, unknown
+package (8):  box, package_corner, package_side, seal, label, contents, item,
+              unknown
+```
+The Stage 3 prompt is given ONLY the list for this claim's `claim_object`, so the
+model cannot pick a part from the wrong object's vocabulary. `ClaimOutput`
+re-validates via a model-level check; an out-of-object part triggers repair.
+
+**`issue_type` `none` vs `unknown` (official rule):**
+```
+issue_type = none     → the relevant part IS visible and NO issue is present
+issue_type = unknown  → the issue OR the part cannot be determined
+```
+So `none` is a positive finding ("I can see the part and it's fine"); `unknown`
+is an epistemic gap ("I can't tell"). Do not use `none` when the part isn't
+visible — that is `unknown`. Mirrors the §3.5 caution bias.
 
 ### Schema Consistency Rules (enforced locally in Stage 4)
 
@@ -2914,28 +2962,32 @@ class ClaimOutput(BaseModel):
     valid_image: bool                  # single boolean: overall image set usable
     severity: Literal["none", "low", "medium", "high", "unknown"]
 
+    # VALID_RISK_FLAGS / OBJECT_PART_VOCAB are module-level constants (§11.2).
     @field_validator("risk_flags")
+    @classmethod
     def validate_risk_flags(cls, v: str) -> str:
-        valid = {
-            "blurry_image", "cropped_or_obstructed", "claim_mismatch",
-            "user_history_risk", "manual_review_required", "wrong_object",
-            "wrong_angle", "damage_not_visible", "non_original_image",
-            "text_instruction_present", "model_consensus_conflict", "none"
-        }
         flags = [f.strip() for f in v.split(";") if f.strip()]
         for flag in flags:
-            if flag not in valid:
-                raise ValueError(f"Invalid risk flag: {flag}")
+            if flag not in VALID_RISK_FLAGS:   # the 14 official flags
+                raise ValueError(f"Invalid risk flag: {flag!r}")
         return v
+
+    @model_validator(mode="after")
+    def validate_object_part(self) -> "ClaimOutput":
+        allowed = OBJECT_PART_VOCAB.get(self.claim_object)
+        if allowed is not None and self.object_part not in allowed:
+            raise ValueError(f"object_part {self.object_part!r} invalid for {self.claim_object!r}")
+        return self
 ```
 
 **Output vocabulary guard — `model_consensus_conflict` is INTERNAL ONLY.**
-The 11 risk flags observed in ground truth are: `none`, `blurry_image`,
-`cropped_or_obstructed`, `claim_mismatch`, `user_history_risk`,
-`manual_review_required`, `wrong_object`, `wrong_angle`, `damage_not_visible`,
-`non_original_image`, `text_instruction_present`. `model_consensus_conflict` is
-our own internal signal and never appears in the sanctioned set — when it fires,
-map it to `manual_review_required` before writing `output.csv`. Never emit an
+The **14 official risk flags** (§11.2) are: `none`, `blurry_image`,
+`cropped_or_obstructed`, `low_light_or_glare`, `wrong_angle`, `wrong_object`,
+`wrong_object_part`, `damage_not_visible`, `claim_mismatch`,
+`possible_manipulation`, `non_original_image`, `text_instruction_present`,
+`user_history_risk`, `manual_review_required`. `model_consensus_conflict` is our
+own internal signal and never appears in the sanctioned set — when it fires, map
+it to `manual_review_required` before writing `output.csv`. Never emit an
 out-of-vocabulary flag.
 
 **CSV serialization — booleans must be lowercase.** `evidence_standard_met` and
@@ -3414,15 +3466,11 @@ Every row is validated before entering the pipeline. Invalid rows get safe defau
 ```python
 class ClaimRowValidator:
     VALID_OBJECTS = {"car", "laptop", "package"}
-    # Sanctioned output vocabulary — exactly 11 values + "none".
+    # Sanctioned output vocabulary — the 14 official flags (§11.2).
+    # Single source of truth: VALID_RISK_FLAGS module constant.
     # model_consensus_conflict is INTERNAL ONLY: remap → manual_review_required
-    # before writing output.csv; never appear here.
-    VALID_RISK_FLAGS = {
-        "blurry_image", "cropped_or_obstructed", "claim_mismatch",
-        "user_history_risk", "manual_review_required", "wrong_object",
-        "wrong_angle", "damage_not_visible", "non_original_image",
-        "text_instruction_present", "none"
-    }
+    # before writing output.csv; never appears here.
+    VALID_RISK_FLAGS = VALID_RISK_FLAGS   # the 14 official flags
     # Internal-only flags that must be remapped before output:
     INTERNAL_FLAG_MAP = {
         "model_consensus_conflict": "manual_review_required",

@@ -93,17 +93,35 @@ hardcoded requirement_id values) — see SYSTEM_DESIGN §4.4. Still confirm:
       `issue_family` Stage 1 emits to the right `applies_to` row (spot-check a
       few: dent→"dent or scratch", water_damage→?, torn_packaging→?).
 
-## 7. Ground-truth value vocabularies (calibrate, don't assume)
+## 7. Allowed-value vocabularies (AUTHORITATIVE — from the official spec)
 
-From the 20 sample rows, confirm the *actual* sets used:
+The official allowed-values lists are THE authority, NOT the 20-sample subset.
+Our validators (`code/pipeline/models.py`, §11.2) encode exactly these. Confirm
+the real files contain only values from these sets (and flag any NEW value the
+spec adds that we haven't encoded):
 
-- [ ] `risk_flags` vocabulary — confirm the 11 flags we sanction match what
-      appears in ground truth; no out-of-vocab flag, no missing flag.
-- [ ] `issue_type` vocabulary — confirm all values (incl. `crushed_packaging`,
-      `glass_shatter`, etc.) are covered by our `Literal` enum.
+- [ ] `risk_flags` — the **14 official flags**: none, blurry_image,
+      cropped_or_obstructed, low_light_or_glare, wrong_angle, wrong_object,
+      wrong_object_part, damage_not_visible, claim_mismatch,
+      possible_manipulation, non_original_image, text_instruction_present,
+      user_history_risk, manual_review_required.
+      (Added vs sample-derived set: low_light_or_glare, wrong_object_part,
+      possible_manipulation. model_consensus_conflict stays internal-only.)
+- [ ] `issue_type` (12): dent, scratch, crack, glass_shatter, broken_part,
+      missing_part, torn_packaging, crushed_packaging, water_damage, stain,
+      none, unknown.
+- [ ] `object_part` — per-object (validated against OBJECT_PART_VOCAB):
+      car (12): front_bumper, rear_bumper, door, hood, windshield, side_mirror,
+                headlight, taillight, fender, quarter_panel, body, unknown
+      laptop (10): screen, keyboard, trackpad, hinge, lid, corner, port, base,
+                body, unknown
+      package (8): box, package_corner, package_side, seal, label, contents,
+                item, unknown
 - [ ] `severity` set is exactly `none/low/medium/high/unknown`.
 - [ ] `claim_status` set is exactly `supported/contradicted/not_enough_information`.
 - [ ] `supporting_image_ids` format: semicolon-separated IDs or `none`.
+- [ ] `issue_type` none-vs-unknown rule: `none` = part visible + no issue;
+      `unknown` = issue/part cannot be determined.
 - [ ] Re-confirm the §11.1 calibration table (all 20 rows) against the real file —
       especially the independence cases (user_008: `valid_image=false` +
       `evidence_standard_met=true`).
