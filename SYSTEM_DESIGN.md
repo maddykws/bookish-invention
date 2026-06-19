@@ -48,7 +48,173 @@ OpenRouter. We build reasoning logic. OpenRouter manages the API infrastructure.
 
 ---
 
-## 3. Chosen Strategy: Strategy B — Multi-Model Cascade via OpenRouter
+## 3. Core Decision Logic: The Three-Verdict Framework
+
+This is the most critical logic in the system. Everything else serves this.
+
+### 3.1 The Three Verdicts Are Categorically Different
+
+```
+supported            "I can see evidence that CONFIRMS this claim"
+contradicted         "I can see evidence that ACTIVELY DENIES this claim"
+not_enough_information  "I cannot make a determination from this evidence"
+```
+
+These are **not** points on a spectrum. `not_enough_information` is not a weak
+`supported` or a cautious `contradicted`. It is a separate epistemic category:
+the image cannot be used to evaluate the claim at all.
+
+### 3.2 Decision Hierarchy — Evaluated in Order
+
+```
+Step 1: Can the claimed OBJECT be identified in the image?
+        NO  → not_enough_information (wrong_object or image too poor)
+            EXCEPTION: if a clearly different object is shown → contradicted
+        YES → continue
+
+Step 2: Can the claimed PART be seen in the image?
+        NO  → not_enough_information (wrong_angle / cropped_or_obstructed)
+        YES → continue
+
+Step 3: Does the image meet the minimum EVIDENCE STANDARD?
+        (check evidence_requirements.csv for this object_type + issue_family)
+        NO  → evidence_standard_met = false → not_enough_information
+              EXCEPTION: if damage is clearly visible despite substandard image
+        YES → evidence_standard_met = true → continue
+
+Step 4: What does the image SHOW on that part?
+        Damage visible + matches claimed type  → supported
+        Damage visible + different type        → contradicted
+        No damage visible on claimed part      → contradicted
+        Damage ambiguous / partially visible   → not_enough_information
+```
+
+### 3.3 The Evidence Standard vs. Claim Status Relationship
+
+These are two independent fields with four valid combinations:
+
+```
+evidence_standard_met | claim_status              | When it happens
+──────────────────────┼───────────────────────────┼────────────────────────────────────
+true                  | supported                 | Clear image, damage matches claim
+true                  | contradicted              | Clear image, damage contradicts claim
+true                  | not_enough_information    | Clear image, but damage is ambiguous
+false                 | not_enough_information    | Image too poor to evaluate
+false                 | contradicted              | Wrong object clearly shown (rare)
+false                 | supported                 ← IMPOSSIBLE — never produce this
+```
+
+The LLM must never produce `evidence_standard_met=false` + `claim_status=supported`.
+This is caught and rejected by the consistency check in Stage 4b.
+
+### 3.4 Multi-Image Decision Rules
+
+When multiple images are submitted, aggregate as follows:
+
+```
+All images unusable (blurry/missing/wrong angle)
+  → evidence_standard_met = false
+  → claim_status = not_enough_information
+  → supporting_image_ids = "none"
+
+At least ONE image clearly supports + evidence standard met
+  → claim_status = supported
+  → supporting_image_ids = that image only (not all images)
+  → blurry_image flag if other images were poor
+
+All usable images clearly contradict
+  → claim_status = contradicted
+  → supporting_image_ids = "none" (contradicting ≠ supporting)
+
+Images conflict (one supports, one contradicts)
+  → claim_status = not_enough_information
+  → risk_flags += claim_mismatch, manual_review_required
+  → justification explains the conflict
+
+Images show different objects (identity mismatch across images)
+  → evidence_standard_met = false
+  → claim_status = not_enough_information
+  → risk_flags += wrong_object
+```
+
+### 3.5 The Bias Rule — When in Doubt
+
+```
+The system is always biased toward caution.
+
+Ambiguous → not_enough_information    NOT a forced verdict
+Weak damage → low severity            NOT "none" if anything is visible
+Partial match → not_enough_information NOT a "supported" with caveats
+
+A cautious "not_enough_information" is an acceptable outcome.
+A confident wrong "supported" or "contradicted" is the worst failure mode.
+
+The cost of a false negative (flagging a valid claim for review):
+  → Human reviews it → claim approved → minor delay
+
+The cost of a false positive (approving a fraudulent claim):
+  → Fraudulent payout → irreversible harm
+```
+
+### 3.6 What the LLM Prompt Must Convey
+
+The vision prompt explicitly teaches this framework to the model:
+
+```
+"You must choose exactly one of three verdicts:
+
+ SUPPORTED: You can see visual evidence that directly confirms
+            what the user claims. The claimed object is visible,
+            the claimed part is visible, and the claimed damage
+            is visible on that part.
+
+ CONTRADICTED: You can see visual evidence that directly refutes
+               what the user claims. Examples: the claimed part
+               shows no damage, the image shows a different object,
+               the image shows different damage than claimed.
+
+ NOT_ENOUGH_INFORMATION: The image cannot be used to evaluate
+                         the claim. The image is too blurry,
+                         the claimed part is not in frame,
+                         the object cannot be identified, or
+                         the damage is ambiguous.
+
+ Key distinction: CONTRADICTED requires positive evidence of
+ the opposite. If you simply cannot tell — that is always
+ NOT_ENOUGH_INFORMATION, not CONTRADICTED."
+```
+
+### 3.7 Severity Alignment with Verdict
+
+```
+claim_status = not_enough_information → severity = unknown (always)
+claim_status = contradicted + no damage → severity = none
+claim_status = contradicted + wrong damage → severity = unknown
+claim_status = supported → severity = low / medium / high based on image
+issue_type = none → severity must be none (caught by consistency check)
+```
+
+### 3.8 Supporting Image IDs — Rules
+
+```
+claim_status = supported:
+  → supporting_image_ids = IDs of images that show the damage
+  → not all images, only the ones that constitute evidence
+  → never empty when status = supported
+
+claim_status = contradicted:
+  → supporting_image_ids = "none"
+  → contradicting images do not "support" the claim
+  → the justification explains what the image shows instead
+
+claim_status = not_enough_information:
+  → supporting_image_ids = "none"
+  → no image supported the claim
+```
+
+---
+
+## 4. Chosen Strategy: Strategy B — Multi-Model Cascade via OpenRouter
 
 ### Why Strategy B
 - Local models handle cheap, fast filtering before any API call
