@@ -26,6 +26,12 @@ logs/
 
 # ChromaDB persistent storage
 chroma_db/
+.chroma/
+
+# Pipeline run artifacts (regenerated each run)
+.cache/
+.checkpoint
+.checkpoint.json
 
 # IDE
 .vscode/
