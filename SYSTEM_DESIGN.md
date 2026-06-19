@@ -2176,9 +2176,18 @@ If setup takes more than 2 minutes, judges mark it down.
 
 ### 23.10 requirements.txt — Complete and Pinned
 
+Last-time components reviewed and deliberately excluded:
+- `langchain` → deterministic pipeline, not a reasoning agent
+- `openai` text-embedding-3-large → replaced by sentence-transformers (local, free, no extra key)
+- `cohere` rerank-v3.5 → adds a third API key with no clear benefit in our pipeline
+- `lancedb` → ChromaDB already in codebase, same job
+- `textual` → Rich is sufficient for batch pipeline output
+
 ```
+# API (OpenRouter — single key, OpenAI-compatible)
+openai>=1.50.0
+
 # Core
-openai>=1.50.0          # OpenRouter uses OpenAI-compatible API
 pydantic>=2.7.0
 python-dotenv>=1.0.0
 
@@ -2187,11 +2196,15 @@ pillow>=10.0.0
 opencv-python>=4.9.0
 numpy>=1.26.0
 
-# Local models (optional — used if available)
+# Local models (optional — GPU path)
 torch>=2.3.0
 torchvision>=0.18.0
 transformers>=4.40.0    # Qwen2-VL, Llama vision
 ultralytics>=8.2.0      # YOLO v8
+
+# Semantic memory + cross-claim fraud detection
+chromadb>=0.5.0
+sentence-transformers>=3.0.0   # all-MiniLM-L6-v2, local, no API key
 
 # CLI + logging
 rich>=13.7.0
@@ -2200,9 +2213,12 @@ tqdm>=4.66.0
 # Data
 pandas>=2.2.0
 
-# Dev
+# Dev + eval
 pytest>=8.0.0
 ```
+
+No LangChain. No Cohere. No LanceDB. No Textual.
+One external API key: `OPENROUTER_API_KEY` only.
 
 ---
 
@@ -2640,7 +2656,141 @@ If it crashes or produces empty output → technical score fails.
 
 ---
 
-## 26. The Unknown Unknown Principle
+## 26. Cache Architecture
+
+Every repeated computation that is pure and deterministic is cached.
+Nothing that involves verdicts is semantic-cached (correctness risk).
+
+---
+
+### 26.1 What Gets Cached vs What Doesn't
+
+| Query type | Cache? | Why |
+|---|---|---|
+| LLM API call (Stage 1, 3, 4c) | ✅ Yes | temperature=0, seed=42 → deterministic |
+| Sentence-transformer embedding | ✅ Yes | Pure function: same text → same vector |
+| ChromaDB semantic query | ✅ Yes | Same embedding → same results (collection fixed mid-batch) |
+| User history lookup | ✅ Yes | Load entire CSV into dict at startup → O(1) |
+| Evidence requirements lookup | ✅ Yes | 11 entries, dict loaded at startup |
+| Verdict by semantic similarity | ❌ No | Same text + different image = different correct verdict |
+
+The semantic-verdict cache is explicitly excluded. A fraudulent claim can deliberately mirror a legitimate one in wording while submitting a fake image. Returning a cached "supported" verdict based on text similarity alone would be a critical security failure.
+
+---
+
+### 26.2 Two-Layer Cache Design
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  L1: In-Memory (this batch run)                             │
+│                                                             │
+│  llm_cache:        dict[str, ClaimOutput]                   │
+│  embedding_cache:  dict[str, list[float]]   ← lru_cache    │
+│  chromadb_cache:   dict[str, QueryResult]                   │
+│                                                             │
+│  Lost on process exit. Handles same-batch duplicates.       │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ L1 miss
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│  L2: Disk (.cache/llm_responses.json)                       │
+│                                                             │
+│  key   = SHA-256(claim_text + "|" + sorted image hashes)   │
+│  value = serialized ClaimOutput (JSON)                      │
+│                                                             │
+│  Persists across runs. Ablation reruns (A0–A8) on same     │
+│  20 claims = only first run hits the API. All subsequent   │
+│  ablation variants read from disk for unchanged claims.     │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ L2 miss
+                        ▼
+                  OpenRouter API call
+              (result written back to L1 + L2)
+```
+
+---
+
+### 26.3 Implementation
+
+```python
+# code/utils/cache.py
+
+import hashlib
+import json
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+from code.pipeline.models import ClaimOutput
+
+
+class ClaimCache:
+    def __init__(self, cache_path: Path = Path(".cache/llm_responses.json")) -> None:
+        self._memory: dict[str, dict] = {}
+        self._path = cache_path
+        self._path.parent.mkdir(exist_ok=True)
+        if self._path.exists():
+            self._memory = json.loads(self._path.read_text())
+
+    @staticmethod
+    def _key(claim_text: str, image_hashes: list[str]) -> str:
+        raw = claim_text + "|" + "|".join(sorted(image_hashes))
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def get(self, claim_text: str, image_hashes: list[str]) -> ClaimOutput | None:
+        hit = self._memory.get(self._key(claim_text, image_hashes))
+        return ClaimOutput(**hit) if hit else None
+
+    def put(self, claim_text: str, image_hashes: list[str], output: ClaimOutput) -> None:
+        k = self._key(claim_text, image_hashes)
+        self._memory[k] = output.model_dump()
+        self._path.write_text(json.dumps(self._memory, indent=2))
+
+    def stats(self) -> dict[str, Any]:
+        return {"entries": len(self._memory), "path": str(self._path)}
+
+
+# Embedding cache — pure function, lru_cache handles L1 automatically
+@lru_cache(maxsize=512)
+def embed_text_cached(text: str, model_name: str) -> tuple[float, ...]:
+    from sentence_transformers import SentenceTransformer
+    model = SentenceTransformer(model_name)
+    return tuple(model.encode(text).tolist())
+```
+
+---
+
+### 26.4 Cache Invalidation Rules
+
+```
+Cache is NEVER invalidated mid-batch.
+Cache is NOT shared between Strategy A and Strategy B runs.
+  → different model = different cache key namespace
+Cache IS shared across ablation variants for claims processed identically.
+  → A0 populates cache; A2 (no consensus) reuses L1/L2 for Stage 3 outputs
+  → but A2 skips Stage 3.6, so consensus results are not cached or reused
+
+To force a full fresh run (e.g., after prompt change):
+  rm -rf .cache/
+```
+
+---
+
+### 26.5 Cache Impact on Ablation Study
+
+Running all 9 ablation variants (A0–A8) on 20 claims:
+
+```
+Without cache:  9 variants × 20 claims × ~800 tokens = 144,000 paid tokens
+With L2 cache:  ~20 claims × ~800 tokens (first run only) = ~16,000 paid tokens
+                Subsequent variants read from disk for identical pipeline stages
+```
+
+This is why L2 matters: it makes the ablation study feasible without burning budget.
+
+---
+
+## 27. The Unknown Unknown Principle
 
 > No enumeration of test cases is complete.
 > Real users will submit inputs that no designer anticipated.
