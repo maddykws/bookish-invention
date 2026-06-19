@@ -1147,11 +1147,12 @@ The model cannot anchor on the claim before forming a visual opinion.
 | CT1 | Image shows completely different damage type than claimed |
 | CT2 | User claims severe damage — image shows only minor scratch |
 | CT3 | User claims damage to one part — image shows different part |
-| CT4 | Claimed part visible and clearly undamaged |
-| CT5 | Image is non-original / screenshot / stock photo |
-| CT6 | Text/instructions embedded in image |
-| CT7 | Object in image ≠ object claimed (different car, toy car, wrong device) |
-| CT8 | Severity claimed as "high" — image shows `none` |
+| CT4 | Claimed part visible and clearly undamaged | `contradicted`, `damage_not_visible`, `severity=none`, `issue_type=none` |
+| CT5 | Image is a screenshot / appears non-original, but damage is still visible | `non_original_image` flag + `manual_review_required` — verdict is still assessed on visible damage; non-original does NOT auto-set `contradicted` |
+| CT6 | Text/instructions embedded in image | `text_instruction_present`; verdict still assessed on visible damage |
+| CT7 | Object in image ≠ object claimed (different car, toy car, wrong device) | `wrong_object` + `claim_mismatch` flags; `claim_status=contradicted`; `issue_type=unknown` (cannot assess claimed object's damage type); `severity=low` if some damage is visible on whatever IS there |
+| CT8 | Severity claimed as "high" — image shows `none` | `claim_status=contradicted`, `severity=none`, `issue_type=none` |
+| CT9 | Damage visible on claimed part but it is DIFFERENT damage type than claimed | `claim_status=contradicted`; `issue_type` = the VISIBLE type (not claimed type); `severity` reflects the visible damage (e.g. user_005: claimed dent, shows scratch → `issue_type=scratch`, `severity=low`) |
 
 ### 9.3 Not Enough Information
 
@@ -1257,7 +1258,7 @@ The model cannot anchor on the claim before forming a visual opinion.
 | ST4 | Claim for object type not in schema (phone, TV) | `issue_type=unknown`, `manual_review_required` |
 | ST5 | `claim_object` in CSV ≠ object in transcript | Flag `claim_mismatch`, use transcript |
 | ST6 | User ID not in user_history.csv | No history flags, treat as new user |
-| ST7 | Image path is a folder, not a file | `valid_image=false` |
+| ST7 | Image path is a folder, not a file | Skip that path; if no other image passes, `valid_image=false` for the overall set; if another image is usable, `valid_image=true` |
 
 ### 9.10 Consensus / Multi-Model Scenarios (New)
 
@@ -1294,7 +1295,9 @@ These cases stress-test whether the model correctly places damage on the scale.
 | SV6 | Borderline low/medium: dent visible but shallow | System must not flip between runs — determinism check |
 | SV7 | Package corner crushed, contents visible intact | `issue_type=crushed_packaging`, `severity=medium`; contents claim → NEI |
 | SV8 | `claim_status=not_enough_information` | `severity` must be `unknown` — consistency rule enforced |
-| SV9 | `claim_status=contradicted` + no damage visible | `severity=none`, `issue_type=none` |
+| SV9a | `claim_status=contradicted` + no damage visible on claimed part (`damage_not_visible` flag) | `severity=none`, `issue_type=none` (user_020, user_034 pattern) |
+| SV9b | `claim_status=contradicted` + DIFFERENT damage visible than claimed | `severity` reflects the actually-visible damage; `issue_type` = visible type, not claimed type (user_005: scratch/low, user_008: broken_part/high) |
+| SV9c | `claim_status=contradicted` + wrong object shown (`wrong_object` flag) | `issue_type=unknown` (can't assess claimed object's damage type); `severity` based on whatever is visible in the image (user_033: low) |
 | SV10 | Severe damage across multiple object parts | `object_part` = primary claimed part; `severity=high` if that part affected |
 
 ### 9.13 Three-Way Input Conflict (CSV vs Transcript vs Image)
@@ -1692,6 +1695,146 @@ These extend the ablation study in Section 22 with experiments motivated by the 
 | A14 | FFT check only vs FFT + EXIF absence + semantic inconsistency check | Tests diffusion fraud detection gap | arXiv:2510.19957 — diffusion images pass FFT |
 
 **These 6 new ablations bring total to A0–A14 (15 variants).** Run A9, A11, A14 as the new minimum set alongside the existing Priority 1–3.
+
+---
+
+### 9.28 Supporting Image ID Selection Precision (Directly Graded)
+
+This is one of the highest-yield categories because `supporting_image_ids` is
+graded as a field — emitting all submitted images when only one is evidentiary
+will score differently from the ground truth. Ground truth: user_003/012 each
+submit 2 images but cite only img_2; user_030 submits 2 and cites only img_1.
+
+| ID | Scenario | Expected `supporting_image_ids` |
+|---|---|---|
+| SI1 | 2 images: img_1 = wide context shot, img_2 = close-up showing damage | `"img_2"` — evidentiary image only, not the context shot |
+| SI2 | 2 images: both show damage from different angles, both informative | `"img_1;img_2"` — both constitute evidence |
+| SI3 | 3 images: img_1 and img_3 show damage, img_2 is wrong angle | `"img_1;img_3"` — skip the non-evidentiary image |
+| SI4 | 2 images: contradicted verdict, img_1 shows the claimed part is clearly undamaged | `"img_1"` — contradicted evidence must still be cited (ground truth) |
+| SI5 | 2 images: NEI verdict, both showed the part but couldn't resolve whether damaged | `"img_1;img_2"` — both informed the inconclusive determination |
+| SI6 | 2 images: NEI verdict because both images were blurry/unreadable | `"none"` — no usable image grounded the read |
+| SI7 | 1 image: supported verdict | `"img_1"` — always cite the single image that grounded the verdict |
+| SI8 | Prompt to LLM must ask: "Which image(s) SPECIFICALLY ground your determination?" | Not "list all images" — ask for the evidentiary subset |
+
+**Key rule:** The prompt must explicitly ask the model to cite only the image(s)
+the determination relies on, not all submitted images.
+
+---
+
+### 9.29 valid_image Independence Tests (Directly Graded)
+
+These verify that `valid_image` is treated as an independent authenticity/
+usability judgment, not derived mechanically from pre-filters or `evidence_standard_met`.
+The user_008 ground truth row (false + true) falsifies any tight coupling.
+
+| ID | Scenario | `valid_image` | `evidence_standard_met` | Why |
+|---|---|---|---|---|
+| VI1 | Image is readable and clearly shows high-severity damage, but has no EXIF camera metadata (possible screenshot or AI-generated) | `false` | `true` | Readable, evidentiary — but not auto-trustworthy (user_008 pattern) |
+| VI2 | All images fail readability pre-filter (blank/corrupt/0-byte) | `false` | `false` | Neither trustworthy nor evidentiary |
+| VI3 | Images are readable, show correct object, but are of a DIFFERENT vehicle (identity mismatch across images) | `true` | `false` | Readable images, but set doesn't meet evidence standard |
+| VI4 | Image readable, part visible, but EXIF shows editing software (Photoshop) | Model judgment — probably `false` | Could be `true` if damage clearly visible | Authenticity doubt ≠ evidentiary doubt |
+| VI5 | Single clear, original image with full EXIF shows damage meeting evidence standard | `true` | `true` | Normal happy-path case |
+| VI6 | `valid_image=true` but all readability pre-filters flagged all images as blurry | Impossible — force `valid_image=false` | Caught by Stage 4b SC7 | |
+
+**Decision rule for implementation:** `valid_image` is set by a DEDICATED model
+judgment in the Stage 3 prompt ("Is this image set usable and trustworthy for
+automated review?") — it is NOT computed from the pre-filter outputs.
+Pre-filter signals (blur, blank, missing file) are inputs to that judgment, not
+the judgment itself. Calibrate the model's threshold against the 20 sample rows.
+
+---
+
+### 9.30 NEI with Non-Unknown issue_type (Ground-Truth-Derived)
+
+Our earlier design forced `issue_type=unknown` on all NEI verdicts. The ground
+truth falsifies this: user_002 has `claim_status=not_enough_information` and
+`issue_type=broken_part`. NEI means "cannot confirm or deny the claim" — not
+"cannot see what the damage type would be."
+
+| ID | Scenario | Expected |
+|---|---|---|
+| NU1 | Two images: img_1 is a close-up of a broken car part; img_2 appears to be a different vehicle. Identity mismatch → NEI | `claim_status=NEI`, `issue_type=broken_part`, `severity=unknown` — the damage type is identifiable even though the claim cannot be confirmed |
+| NU2 | Image shows a clear crack on a laptop screen, but the image appears to be of a different laptop model than claimed | `claim_status=NEI`, `issue_type=crack`, `severity=unknown` |
+| NU3 | Image is badly blurred but the shape of a dent is still discernible | `claim_status=NEI` (blur → insufficient evidence), `issue_type=dent` if discernible, `severity=unknown` |
+| NU4 | Correct object visible but wrong angle — no view of claimed part; claim was about "windshield crack" | `claim_status=NEI`, `issue_type=unknown` — cannot even identify issue type from what's visible |
+
+**Rule:** `issue_type=unknown` on NEI only when the damage type itself cannot be
+determined from the images. If the damage type is visible even though the claim
+cannot be confirmed, output the identifiable `issue_type` with `severity=unknown`.
+
+---
+
+### 9.31 Contradicted Full Output Specification
+
+Earlier test cases (CT1–CT9) named the scenario but left the output underspecified.
+This section pins down the full expected output for each contradicted subcase,
+derived from ground truth patterns.
+
+| ID | Ground Truth Pattern | Claim | Image | Full Expected Output |
+|---|---|---|---|---|
+| CO1 | user_020 pattern | "trackpad damage" | No damage visible on trackpad | `contradicted`, `damage_not_visible`, `issue_type=none`, `severity=none`, `supporting_image_ids=img_1` |
+| CO2 | user_034 pattern | "torn seal" | Seal visible, not torn | `contradicted`, `damage_not_visible`, `text_instruction_present`, `user_history_risk`, `manual_review_required`, `issue_type=none`, `severity=none`, `supporting_image_ids=img_1;img_2` |
+| CO3 | user_005 pattern | "rear bumper damage (implied severe)" | Visible scratch, not the claimed level | `contradicted`, `claim_mismatch`, `user_history_risk`, `manual_review_required`, `issue_type=scratch`, `severity=low`, `supporting_image_ids=img_1` |
+| CO4 | user_008 pattern | "front bumper claim" | Clear broken part shown, but wrong car | `contradicted`, `claim_mismatch`, `non_original_image`, `user_history_risk`, `manual_review_required`, `issue_type=broken_part`, `severity=high`, `valid_image=false`, `evidence_standard_met=true` |
+| CO5 | user_033 pattern | Claim about a package | Wrong object shown | `contradicted`, `wrong_object`, `claim_mismatch`, `user_history_risk`, `manual_review_required`, `issue_type=unknown`, `severity=low` |
+
+**Key invariant from ground truth:** All 5 contradicted rows populate
+`supporting_image_ids`. The cited image is the one showing the contradicting
+evidence — never `"none"` when a usable image informed the contradicted verdict.
+
+---
+
+### 9.32 User History Integration Rules
+
+The `user_history.csv` columns are: `user_id`, `past_claim_count`,
+`accept_claim`, `manual_review_claim`, `rejected_claim`,
+`last_90_days_claim_count`, `history_flags`, `history_summary`.
+
+The `history_flags` field directly maps to `user_history_risk`. These tests
+verify the integration boundary.
+
+| ID | user_history.csv values | Expected risk_flags effect |
+|---|---|---|
+| UH1 | `history_flags="user_history_risk"` | Add `user_history_risk` to risk_flags always |
+| UH2 | `history_flags="none"`, `rejected_claim=0` | Do NOT add `user_history_risk` |
+| UH3 | `history_flags="none"`, `rejected_claim=3`, `past_claim_count=7` | `user_history_risk` NOT added from count alone — only from `history_flags` column. Do not re-derive risk from raw counts; trust the pre-computed column. |
+| UH4 | `history_flags="user_history_risk;manual_review_required"` (hypothetical) | Both flags are appended |
+| UH5 | `user_id` not found in `user_history.csv` | No history flags; treat as new user; no `user_history_risk` |
+| UH6 | `user_id` appears twice in batch, second claim is also a contradicted scenario | Each claim processed independently; `user_history_risk` applied from file on each |
+| UH7 | `last_90_days_claim_count >= 5` but `history_flags="none"` | No flag — trust the pre-computed column, not a self-derived threshold |
+
+**Implementation rule:** Read the `history_flags` column verbatim. Do NOT
+recompute risk from `rejected_claim`, `past_claim_count`, or
+`last_90_days_claim_count` — those were already distilled into `history_flags`
+by whoever generated `user_history.csv`. Deriving your own threshold on raw
+counts is fragile and will diverge from the ground truth evaluation.
+
+---
+
+### 9.33 Output Serialization Tests (Silent Scoring Failure Vector)
+
+These don't test model reasoning — they test the CSV writer. A wrong boolean
+case or wrong column order produces a structurally valid CSV that silently scores
+0 on affected rows when compared against ground truth.
+
+| ID | Scenario | Expected | Failure Mode |
+|---|---|---|---|
+| SER1 | `evidence_standard_met=True` (Python bool) written to CSV | `"true"` (lowercase string) | Python's default `str(True)` → `"True"` which doesn't match ground truth `"true"` |
+| SER2 | `valid_image=False` (Python bool) written to CSV | `"false"` (lowercase string) | Same — `str(False)` → `"False"` |
+| SER3 | `risk_flags` with 4 flags | `"damage_not_visible;text_instruction_present;user_history_risk;manual_review_required"` | No space after semicolon; exact order consistent within claim |
+| SER4 | `model_consensus_conflict` internal flag reaches output writer | Must be remapped to `"manual_review_required"` | `model_consensus_conflict` is out-of-vocabulary; emitting it → immediate field fail |
+| SER5 | Output CSV column order | `user_id, image_paths, user_claim, claim_object, evidence_standard_met, evidence_standard_met_reason, risk_flags, issue_type, object_part, claim_status, claim_status_justification, supporting_image_ids, valid_image, severity` | Wrong order → every field in wrong column → 0/row |
+| SER6 | `supporting_image_ids="none"` vs `supporting_image_ids=""` | Must be the literal string `"none"` when no images cited | Empty string would likely score 0 on that field |
+| SER7 | `risk_flags="none"` vs `risk_flags=""` | Must be the literal string `"none"` when no flags | Same — ground truth uses `"none"` not empty string |
+| SER8 | `claim_text` written to output instead of `user_claim` | Column header must be `user_claim` in output.csv | Different column name → all rows in that column score 0 |
+| SER9 | One extra column written to output.csv | Eval harness strict header match | Extra column shifts all subsequent columns |
+
+**Implementation check:** After producing output.csv, run an assertion that
+reads back the header row and compares it character-for-character to:
+```python
+EXPECTED_HEADER = "user_id,image_paths,user_claim,claim_object,evidence_standard_met,evidence_standard_met_reason,risk_flags,issue_type,object_part,claim_status,claim_status_justification,supporting_image_ids,valid_image,severity"
+```
+Fail fast with a clear error, not a silent wrong output.
 
 ---
 
