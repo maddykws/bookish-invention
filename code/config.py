@@ -16,19 +16,72 @@ class Config:
     openrouter_site_url: str = "https://github.com/maddykws/bookish-invention"
     openrouter_app_title: str = "damage-claim-verifier"
 
+    # ── Provider fallback registry (resolve_provider in code/providers.py) ────
+    # PRIMARY = OpenRouter (one key, every model). If OPENROUTER_API_KEY is
+    # absent/blocked, each model role resolves to a DIRECT vendor API whose key
+    # is present. All vendors expose an OpenAI-compatible endpoint, so the same
+    # `openai` client + a base_url swap covers all of them — no extra SDK.
+    # Only OpenRouter + Anthropic are required; OpenAI/xAI/Google/Groq are
+    # consulted ONLY when their key is set (else the jury shrinks/degrades safe).
+    #   each entry: vendor -> (base_url, api_key_env_var)
+    provider_registry: dict[str, tuple[str, str]] = field(default_factory=lambda: {
+        "openrouter": ("https://openrouter.ai/api/v1",          "OPENROUTER_API_KEY"),
+        "anthropic":  ("https://api.anthropic.com/v1",          "ANTHROPIC_API_KEY"),
+        "openai":     ("https://api.openai.com/v1",             "OPENAI_API_KEY"),
+        "xai":        ("https://api.x.ai/v1",                   "XAI_API_KEY"),
+        "google":     ("https://generativelanguage.googleapis.com/v1beta/openai", "GOOGLE_API_KEY"),
+        "groq":       ("https://api.groq.com/openai/v1",        "GROQ_API_KEY"),  # hosts Llama vision
+    })
+    # When OpenRouter is unavailable, map each role to a DIRECT-vendor model id.
+    # Stage 1/3/repair (Claude) -> Anthropic native ids. Jury -> native ids on
+    # whichever vendor keys exist; missing vendors are dropped (consensus
+    # degrades to "accept Opus verdict + flag manual_review" — the safe direction).
+    direct_model_ids: dict[str, str] = field(default_factory=lambda: {
+        # role / openrouter-id            -> direct-vendor native id
+        "anthropic/claude-opus-4-8":       "claude-opus-4-8",
+        "anthropic/claude-sonnet-4-6":     "claude-sonnet-4-6",
+        "anthropic/claude-haiku-4-5":      "claude-haiku-4-5",
+        "openai/gpt-4o":                   "gpt-4o",
+        "x-ai/grok-2-vision-1212":         "grok-2-vision-1212",
+        "google/gemini-2.5-flash":         "gemini-2.5-flash",
+        "meta-llama/llama-3.2-11b-vision-instruct": "llama-3.2-11b-vision-preview",  # Groq id
+    })
+
     # ── Stage-named models (no ambiguity vs ablation labels) ──────────────────
     # Pricing (per 1M tok, OpenRouter ≈ Anthropic): opus-4-8 $5/$25 ·
     # sonnet-4-6 $3/$15 · haiku-4-5 $1/$5. Opus is only ~1.67x Sonnet, and is
     # the strongest visual reasoner — used for the load-bearing verdict (Stage 3).
     stage1_model: str = "anthropic/claude-haiku-4-5"           # transcript parse (cheap text)
-    stage3_primary_model: str = "anthropic/claude-opus-4-8"    # visual reasoning (best)
+    stage3_primary_model: str = "anthropic/claude-opus-4-8"    # visual reasoning (best — owns the verdict)
     stage3_primary_cpu_fallback: str = "anthropic/claude-sonnet-4-6"  # cheaper fallback
     stage3_repair_model: str = "anthropic/claude-haiku-4-5"    # targeted repair (cheap)
-    crosscheck_model_a: str = "google/gemini-2.5-flash"        # free tier
-    crosscheck_model_b: str = "meta-llama/llama-3.2-11b-vision-instruct"  # free tier
 
     # ── Strategy A model (single-call baseline for evaluation comparison) ─────
     strategy_a_model: str = "anthropic/claude-opus-4-8"
+
+    # ── Stage 3.6 consensus JURY — multi-vendor, all via OpenRouter ──────────
+    # The verdict stays on Opus (best single model). The jury is independent
+    # cross-vendor second opinions — diversity here RAISES accuracy. Tiered so
+    # paid vendors only fire on the hardest claims (token optimization):
+    #   Tier 1 (soft escalation) → FREE models only ($0)
+    #   Tier 2/3 (hard / disagreement) → add PAID models for true cross-vendor vote
+    consensus_free_models: tuple[str, ...] = (
+        "google/gemini-2.5-flash",                      # Google  (free)
+        "meta-llama/llama-3.2-11b-vision-instruct",     # Meta    (free)
+    )
+    consensus_paid_models: tuple[str, ...] = (
+        "openai/gpt-4o",                                # OpenAI  (paid, hard cases)
+        "x-ai/grok-2-vision-1212",                      # xAI     (paid, hard cases)
+    )
+    # Weighted vote (primary-dominant). Keyed by vendor family; normalized over
+    # whichever models actually ran. Opus owns the largest share.
+    consensus_weights: dict[str, float] = field(default_factory=lambda: {
+        "primary": 0.40,   # Opus 4.8 — the verdict
+        "openai":  0.20,   # gpt-4o
+        "google":  0.15,   # gemini
+        "xai":     0.15,   # grok
+        "meta":    0.10,   # llama
+    })
 
     # ── Prompt caching ────────────────────────────────────────────────────────
     # Minimum cacheable prefix is model-dependent: opus-4-8 = 4096 tokens,

@@ -878,10 +878,14 @@ OpenRouter tries models in order. If the first is rate-limited or fails, it sile
 ```
 Stage 1  (transcript)   → claude-haiku-4-5   │ gemini-2.5-flash
 Stage 3  (reasoning)    → claude-opus-4-8    │ claude-sonnet-4-6 │ gemini-2.5-flash
-Stage 3.6 cross-check A → gemini-2.5-flash   │ qwen2-vl-7b        (free tier)
-Stage 3.6 cross-check B → llama-3.2-11b-vision│ qwen2-vl-7b       (free tier)
+Stage 3.6 jury (free)   → gemini-2.5-flash   +  llama-3.2-11b-vision   (Tier 1, $0)
+Stage 3.6 jury (paid)   → gpt-4o             +  grok-2-vision          (Tier 2/3, hard cases)
 Stage 4c (repair)       → claude-haiku-4-5   │ gemini-2.5-flash
 ```
+
+The jury is a multi-vendor panel (Google + Meta free; OpenAI + xAI on hard
+cases) cross-checking the Opus verdict — see §4.7 for why diversity belongs in
+the jury, not the verdict, and how it resolves under provider fallback.
 
 ### 4.4 Token + Cost + Latency — From OpenRouter, Not Our Code
 
@@ -917,13 +921,67 @@ Provider TPM/RPM limit hit?
 Free-tier models (Gemini Flash, Llama Vision) absorb overflow at zero cost.
 ```
 
-### 4.6 Environment Variables (One Key Only)
+### 4.6 Environment Variables (One Key in the Happy Path)
 
 ```
-OPENROUTER_API_KEY   → all API calls, all models, all stages
+OPENROUTER_API_KEY   → all API calls, all models, all stages  (PRIMARY)
 ```
 
-No `ANTHROPIC_API_KEY`. No `GOOGLE_API_KEY`. OpenRouter proxies everything.
+In the normal case this is the **only** variable needed — OpenRouter proxies
+every vendor. The optional direct-vendor keys below are consulted ONLY as a
+fallback when OpenRouter is unavailable (see §4.7); absent, the pipeline still
+runs on OpenRouter alone.
+
+---
+
+### 4.7 Provider Fallback — Multi-Vendor, OpenRouter-First (decided)
+
+**The verdict belongs to the best single model; the jury belongs to many
+vendors.** These are two different jobs and multi-vendor diversity helps in only
+one of them:
+
+```
+Stage 3 VERDICT  → ONE best model (Opus 4.8). A mixed-vendor majority vote would
+                   let weaker models outvote the strongest visual reasoner and
+                   LOWER accuracy. Reproducible: one model = explainable failures.
+Stage 3.6 JURY   → MANY vendors. Independent cross-vendor second opinions catch
+                   errors a single vendor repeats. Diversity here RAISES accuracy.
+```
+
+So the multi-vendor models (GPT-4o, Grok, Gemini, Llama) are the **consensus
+jury** cross-checking the Opus verdict — not competing verdict models. Five
+vendors participate in the system: Anthropic (verdict) + Google + Meta + OpenAI
++ xAI (jury).
+
+**Provider resolution (`code/providers.py`, decided at Stage 0).**
+All vendors expose an OpenAI-compatible endpoint, so provider switching is just
+`base_url` + key + model-id — the `openai` SDK is the single spine, no second
+client. Resolution is **OpenRouter-first**, then direct vendors by key presence:
+
+```
+if OPENROUTER_API_KEY present → use OpenRouter for EVERY role (one key, full jury)
+else, per role:
+   Claude roles (Stage 1/3/repair) → Anthropic-direct (ANTHROPIC_API_KEY)   [required fallback]
+   jury: gpt-4o   → OpenAI-direct  (OPENAI_API_KEY)   if present, else drop
+         grok     → xAI-direct     (XAI_API_KEY)      if present, else drop
+         gemini   → Google-direct  (GOOGLE_API_KEY)   if present, else drop
+         llama    → Groq-direct     (GROQ_API_KEY)     if present, else drop
+```
+
+`provider_registry` (base_url + key env var) and `direct_model_ids`
+(OpenRouter id → native vendor id) live in `Config`. **Only OpenRouter +
+Anthropic are required.** Every other vendor is optional: if its key is absent,
+that jury member is simply dropped and consensus degrades **safe** — the Opus
+verdict is unaffected and uncertain claims escalate to `manual_review_required`
+(a flagged valid claim = minor delay; never a wrong auto-approval).
+
+**Network caveat:** whichever provider is active, its host must be in the run
+environment's egress allowlist (`openrouter.ai`, or `api.anthropic.com` +
+the chosen jury hosts). A blocked host fails the same way a missing key does —
+Stage 0 probes the active provider and logs which one resolved.
+
+This is also ablation A19 (OpenRouter full jury vs Anthropic-only fallback):
+report the accuracy delta so the fallback's safe-degradation is quantified.
 
 ---
 
@@ -1074,47 +1132,49 @@ No `ANTHROPIC_API_KEY`. No `GOOGLE_API_KEY`. OpenRouter proxies everything.
                                │ (consensus triggered)
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  STAGE 3.6 — CROSS-CHECK (OpenRouter, free-tier models)        │
+│  STAGE 3.6 — CROSS-CHECK JURY (OpenRouter, multi-vendor, TIERED)│
 │                                                                 │
-│  Run in parallel:                                               │
+│  The verdict is already set by Opus (Stage 3). The jury is      │
+│  INDEPENDENT cross-vendor second opinions, run in parallel.     │
+│  Tiered so paid vendors only fire on the hardest claims:        │
 │                                                                 │
-│  Check A: Via OpenRouter → gemini-2.5-flash                    │
-│           X-Title: "stage36-crosscheck-a"                      │
-│           Same images + claim, same prompt structure           │
-│           Returns: { claim_status, severity, issue_type }      │
+│  Tier 1 (soft escalation) — FREE models only, $0:               │
+│    Check A → google/gemini-2.5-flash      (Google)              │
+│    Check B → meta-llama/llama-3.2-vision  (Meta)                │
 │                                                                 │
-│  Check B: Via OpenRouter → llama-3.2-11b-vision                │
-│           X-Title: "stage36-crosscheck-b"                      │
-│           Same images + claim, same prompt structure           │
-│           Returns: { claim_status, severity, issue_type }      │
+│  Tier 2/3 (hard escalation / disagreement) — ADD paid vendors:  │
+│    Check C → openai/gpt-4o                (OpenAI)              │
+│    Check D → x-ai/grok-2-vision           (xAI)                │
 │                                                                 │
-│  Both use free-tier models → $0 additional cost                │
+│  Each returns the 4-field mini-schema                           │
+│  { claim_status, confidence, severity, issue_type } — never a   │
+│  full re-output (output-token optimization).                    │
+│  Fallback (no OpenRouter): jury shrinks to vendors whose direct │
+│  key is present; missing vendors are dropped (§4.7).            │
 └──────────────────────────────┬──────────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  STAGE 3.7 — CONSENSUS AGGREGATION (local, 0 tokens)           │
 │                                                                 │
-│  Inputs: verdict_A (Haiku), verdict_B (Gemini), verdict_C (Llama)│
+│  Inputs: Opus (primary verdict) + jury verdicts (2–4 vendors)   │
+│  Weighted vote (Config.consensus_weights, normalized over the   │
+│  models that actually ran; Opus owns 0.40, jury splits rest):   │
 │                                                                 │
-│  All three agree                                                │
-│    → Use that verdict, confidence = HIGH                       │
-│    → No additional flags                                       │
+│  All agree → use that verdict, confidence = HIGH, no flags      │
 │                                                                 │
-│  Two agree, one dissents                                        │
-│    → Use majority verdict, confidence = MEDIUM                 │
-│    → Note dissent in justification                             │
+│  Majority agree → use majority verdict, confidence = MEDIUM     │
+│    → note dissent in justification                              │
 │                                                                 │
-│  All three disagree                                             │
-│    → claim_status = not_enough_information                     │
-│    → risk_flags += [manual_review_required,                    │
+│  No majority → claim_status = not_enough_information            │
+│    → risk_flags += [manual_review_required,                     │
 │                     model_consensus_conflict]                   │
-│    → justification: "Models reached no consensus:             │
-│        Haiku=[X] Gemini=[Y] Llama=[Z]"                        │
+│    → justification: "Jury reached no consensus:               │
+│        Opus=[W] GPT4o=[X] Gemini=[Y] Grok=[Z] Llama=[Q]"      │
 │                                                                 │
-│  Primary (Haiku) is the dissenter                               │
-│    → Flag: model_consensus_conflict                            │
-│    → Note in justification, proceed with majority             │
+│  Primary (Opus) is the lone dissenter vs a jury majority        │
+│    → flag model_consensus_conflict, note it, proceed w/ majority│
+│    (model_consensus_conflict → manual_review_required on output)│
 └──────────────────────────────┬──────────────────────────────────┘
                                │
                                ▼
@@ -2888,12 +2948,19 @@ A7  -Fraud  Full B without EXIF/adversarial noise checks               ?/20  ~90
 A8  -Repair Full B without repair loop (fail → safe defaults)          ?/20  ~750           $X      ~1,000ms
 A17 -Cache  Full B without Anthropic prompt caching                    ?/20  ~1,400         $X      ~1,200ms
 A18 Model   Full B with Sonnet 4.6 as Stage 3 (vs Opus 4.8 in A0)      ?/20  ~900           $X      ~1,100ms
+A19 Jury    Full B 2-vendor free jury vs 4-vendor jury (+GPT-4o,Grok)  ?/20  ~900/~1300     $X      ~1,200ms
 ```
 
 **A18 directly satisfies the rubric's "≥2 model configurations compared":** same
 pipeline, Stage 3 swapped Opus 4.8 ↔ Sonnet 4.6. Reports the accuracy gain of
 Opus against its ~1.67× input / 1.67× output cost premium, so the model choice is
 justified with measured numbers rather than asserted.
+
+**A19 measures the multi-vendor jury's value:** 2-vendor free jury (Gemini +
+Llama) vs the full 4-vendor jury (adds paid GPT-4o + Grok on hard cases). Shows
+whether the extra cross-vendor diversity changes verdicts on the hard rows and
+what it costs — quantifying §4.7's tiered design. Also the OpenRouter-full vs
+Anthropic-only-fallback comparison lives here.
 
 All numbers filled in after code runs against sample_claims.csv.
 
@@ -4289,42 +4356,43 @@ All decisions are local — no extra tokens spent at the gate itself.
 
 ### 27.3 Confidence Aggregation Formula
 
-When models agree on the same `claim_status`, compute a weighted confidence score.
-Sonnet 4.6 carries the highest weight as the primary reasoning model.
+When the jury agrees on the same `claim_status`, compute a weighted confidence
+score. Opus 4.8 (the verdict) carries the highest weight; the jury vendors split
+the rest. Weights live in `Config.consensus_weights` (vendor-keyed) and are
+**normalized over whichever models actually ran** — so a shrunk jury (Tier 1
+free-only, or a fallback with missing vendor keys) still produces a valid score.
 
 ```python
-MODEL_WEIGHTS: dict[str, float] = {
-    "sonnet":  0.50,   # primary model — strongest visual reasoning
-    "gemini":  0.30,   # secondary cross-checker
-    "llama":   0.20,   # tertiary cross-checker
-}
+# Config.consensus_weights — vendor-keyed, primary-dominant (sums to 1.0):
+#   primary(Opus) 0.40 · openai(gpt-4o) 0.20 · google(gemini) 0.15
+#   xai(grok) 0.15 · meta(llama) 0.10
 
 def aggregate_confidence(
-    sonnet_conf: float,
-    gemini_conf: float | None,
-    llama_conf:  float | None,
+    primary_conf: float,                       # Opus 4.8 — always present
+    jury_confs: dict[str, float],              # {vendor: confidence} for jurors that ran
+    weights: dict[str, float],                 # Config.consensus_weights
 ) -> float:
+    """Weighted confidence over the models that actually ran.
+
+    Normalized by total participating weight, so Tier-1 (free jurors only) and
+    fallback (some vendors dropped) both yield a calibrated score. Missing
+    jurors simply don't contribute — their weight is never counted.
     """
-    Compute weighted confidence when models agree on verdict.
-    If a cross-checker is unavailable (None), redistribute its weight to Sonnet.
-    """
-    total_weight = MODEL_WEIGHTS["sonnet"]
-    score = sonnet_conf * MODEL_WEIGHTS["sonnet"]
-
-    if gemini_conf is not None:
-        score        += gemini_conf * MODEL_WEIGHTS["gemini"]
-        total_weight += MODEL_WEIGHTS["gemini"]
-
-    if llama_conf is not None:
-        score        += llama_conf  * MODEL_WEIGHTS["llama"]
-        total_weight += MODEL_WEIGHTS["llama"]
-
-    return score / total_weight   # normalise if a model was unavailable
+    score = primary_conf * weights["primary"]
+    total = weights["primary"]
+    for vendor, conf in jury_confs.items():
+        w = weights.get(vendor, 0.0)
+        score += conf * w
+        total += w
+    return score / total if total else primary_conf
 ```
 
-When models **disagree** — weighted confidence is not computed.
-Confidence is forced to `0.0` and verdict forced to `not_enough_information`.
-You cannot have collective confidence when you have no collective verdict.
+When the jury **disagrees with no majority** — weighted confidence is not
+computed. Confidence is forced to `0.0` and the verdict to
+`not_enough_information` + `manual_review_required`. You cannot have collective
+confidence when you have no collective verdict. When the jury is empty entirely
+(fallback with no extra vendor keys), the Opus verdict stands and uncertain rows
+escalate to manual review (consensus degraded safe — §4.7).
 
 ---
 
