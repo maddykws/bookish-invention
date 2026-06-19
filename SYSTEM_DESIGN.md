@@ -339,20 +339,66 @@ def truncate_transcript(transcript: str, max_turns: int = 8) -> str:
 
 **Source:** `image_paths` column in claims.csv, semicolon-separated
 
-**Format:**
+**Format (exactly as stored in the CSV):**
 ```
-images/sample/case_001/img_1.jpg
-images/sample/case_002/img_1.jpg;images/sample/case_002/img_2.jpg
+images/test/case_001/img_1.jpg
+images/test/case_001/img_1.jpg;images/test/case_001/img_2.jpg
+images/sample/case_002/img_1.jpg          (sample_claims.csv rows)
 ```
 
-**Image ID mapping — critical for output correctness:**
+**⚠ CRITICAL — path resolution (silent-failure class).**
+The path stored in the CSV begins with `images/...`, **without** the `dataset/`
+prefix. The actual file lives at `dataset/images/...`. If the loader opens the
+raw CSV path verbatim, every image raises `FileNotFoundError`, every claim
+degrades to `not_enough_information`, and the run completes without crashing
+while scoring near-zero on accuracy. This is invisible (no exception bubbles up)
+and catastrophic — exactly the failure profile to design against.
+
+Every stage that touches an image path MUST go through one resolver:
+
+```python
+from pathlib import Path
+
+DATASET_ROOT = Path("dataset")
+
+def resolve_image_path(csv_path: str) -> Path:
+    """Resolve a CSV image_paths entry to an on-disk file.
+
+    CSV stores 'images/test/case_001/img_1.jpg' (no 'dataset/' prefix);
+    the file lives at 'dataset/images/test/case_001/img_1.jpg'.
+    Tries, in order:
+      1. dataset/<csv_path>                  (the normal case)
+      2. <csv_path> as-is                    (already absolute / already prefixed)
+      3. dataset/ + basename-walked variant  (defensive, e.g. leading './')
+    Returns the first path that exists; falls back to candidate #1 so the
+    ProcessedImage.exists=False path is taken and the claim is flagged, not crashed.
+    """
+    raw = csv_path.strip().lstrip("./")
+    candidates = [
+        DATASET_ROOT / raw,          # dataset/images/test/...
+        Path(raw),                   # images/test/...  (cwd already dataset/)
+        Path(csv_path.strip()),      # verbatim (absolute paths, future datasets)
+    ]
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    return candidates[0]             # canonical guess → exists=False downstream
+```
+
+The resolver is the ONLY place path-prefix logic lives. `extract_image_id`
+operates on the original CSV string (filename only), independent of resolution:
+
 ```python
 def extract_image_id(path: str) -> str:
-    # "images/sample/case_002/img_1.jpg" → "img_1"
+    # "images/test/case_001/img_1.jpg" → "img_1"
     return Path(path).stem   # stem = filename without extension
 
 # Result: supporting_image_ids uses these IDs: "img_1", "img_2", etc.
+# IDs are claim-local (unique within a case_XXX folder), never full paths.
 ```
+
+A unit test asserts `resolve_image_path("images/sample/case_XXX/img_1.jpg")`
+points at an existing file for at least one real sample row before any batch run.
 
 **Per-image processing model:**
 ```python
@@ -3164,6 +3210,10 @@ One variable. Clear instructions. No excuse for confusion.
 [ ] logs/ directory is created on first run (not committed)
 [ ] checkpoint file enables resume after interruption
 [ ] temperature=0 set on all API calls
+[ ] resolve_image_path() locates ≥1 real sample image at startup (path-prefix
+    sanity assertion) — guards the silent dataset/ prefix failure (§4.2)
+[ ] Stage 0 logs the image-resolution hit rate; if 0% of images resolve, abort
+    with a clear error instead of producing an all-NEI output.csv
 ```
 
 ---
