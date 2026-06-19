@@ -55,7 +55,9 @@ class Config:
     checkpoint_path: str = ".checkpoint"
     log_path: str = "logs/pipeline.log"
     cache_path: str = ".cache/llm_responses.json"
-    eval_report_path: str = "evaluation/report.json"
+    eval_report_path: str = "code/evaluation/report.json"
+    images_sample_dir: str = "dataset/images/sample"
+    images_test_dir: str = "dataset/images/test"
 
     # ── Ablation feature flags (all True = full Strategy B) ───────────────────
     use_consensus: bool = True

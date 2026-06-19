@@ -2181,53 +2181,75 @@ Which model was most accurate on disagreement cases:
 
 ## 14. File Structure
 
+**Authoritative layout — matches the hackathon's official repo structure exactly.**
+The provided structure places the evaluation entry point at `code/evaluation/main.py`
+(NOT at repo root). The judges run `python code/main.py` and
+`python code/evaluation/main.py` — both entry points must exist at those exact paths.
+
 ```
+AGENTS.md                        # Provided — AI tool rules + transcript logging
+problem_statement.md             # Provided — full task description and I/O schema
+README.md                        # Required — setup, usage, env vars (under 2 min)
+
 code/
-├── main.py                      # Entry point: reads claims.csv, writes output.csv
+├── main.py                      # OFFICIAL entry point: reads dataset/claims.csv → output.csv
+├── config.py                    # Single Config dataclass — every setting lives here
+├── capabilities.py              # Stage 0 — probe torch/cuda/ultralytics, set degradation flags
 ├── pipeline/
 │   ├── __init__.py
+│   ├── models.py                # All Pydantic models (ClaimRow, ClaimOutput, ...)
 │   ├── transcript_parser.py     # Stage 1 — via OpenRouter
 │   ├── image_preprocessor.py    # Stage 2 — local only
 │   ├── local_vlm.py             # Stage 2.5 — GPU optional, local only
-│   ├── api_reasoner.py          # Stage 3 — via OpenRouter
-│   ├── consensus_gate.py        # Stage 3.5 — local decision
+│   ├── chroma_memory.py         # ChromaDB dual role — fraud + session memory
+│   ├── api_reasoner.py          # Stage 3 — via OpenRouter (Sonnet 4.6 + prompt cache)
+│   ├── consensus_gate.py        # Stage 3.5 — local escalation-tier decision
 │   ├── cross_checker.py         # Stage 3.6 — via OpenRouter (free models)
 │   ├── consensus_aggregator.py  # Stage 3.7 — local aggregation
 │   ├── output_validator.py      # Stage 4a + 4b — local
 │   ├── repair_loop.py           # Stage 4c — via OpenRouter
 │   └── safe_defaults.py         # Stage 4d — local
 ├── models/
-│   ├── yolo_checker.py          # YOLO v8 object detection
-│   ├── clip_matcher.py          # CLIP semantic match
-│   └── gpu_utils.py             # nvidia-smi check, capability flags
+│   ├── yolo_checker.py          # YOLO v8 object detection (GPU optional)
+│   ├── clip_matcher.py          # CLIP semantic match (GPU optional)
+│   └── gpu_utils.py             # capability flags
 ├── utils/
+│   ├── __init__.py
+│   ├── logger.py                # Rich + file + AGENTS.md log
+│   ├── injection.py             # Pre-LLM injection screener
 │   ├── image_utils.py           # Resize, hash, blank/blur/EXIF/FFT checks
 │   ├── openrouter_client.py     # Single OR client + generation_id tracking
+│   ├── cache.py                 # Two-layer cache (L1 memory + L2 disk)
 │   ├── checkpoint.py            # Resume logic
 │   └── metrics_collector.py     # Queries OR /generation API post-batch
-└── prompts/
-    ├── transcript_prompt.py
-    ├── vision_prompt.py
-    └── repair_prompt.py
-
-evaluation/
-├── main.py                      # Runs Strategy A + B on sample_claims.csv
-├── metrics.py                   # Pulls from OR generation API
-└── report.py                    # Generates comparison report + consensus analysis
+├── prompts/
+│   ├── transcript_prompt.py
+│   ├── vision_prompt.py
+│   └── repair_prompt.py
+└── evaluation/
+    ├── __init__.py
+    ├── main.py                  # OFFICIAL entry point: Strategy A + B on sample_claims.csv
+    ├── metrics.py               # Pulls from OR generation API
+    ├── report.py                # Comparison report + consensus analysis
+    └── report.json             # Written output — the primary technical artifact
 
 dataset/
-├── claims.csv
-├── sample_claims.csv
-├── evidence_requirements.csv
-├── user_history.csv
+├── claims.csv                   # Inputs only — run the system on these rows
+├── sample_claims.csv            # Inputs + expected outputs (development)
+├── evidence_requirements.csv    # Minimum image evidence requirements
+├── user_history.csv             # Historical claim counts + risk context
 └── images/
-    ├── sample/
-    └── test/
+    ├── sample/                  # Images referenced by sample_claims.csv
+    └── test/                    # Images referenced by claims.csv
 
-README.md                        # Required by AGENTS.md — setup, usage, env vars
 $HOME/hackerrank_orchestrate/
 └── log.txt                      # Required by AGENTS.md — append-only interaction log
 ```
+
+**Structural enforcement rule:** `code/evaluation/main.py` is a hard requirement,
+not a suggestion. Earlier drafts placed `evaluation/` at the repo root; that is
+corrected here to match the official tree. The eval report is written to
+`code/evaluation/report.json` (see `Config.eval_report_path`).
 
 ---
 
@@ -2999,12 +3021,13 @@ async def process_all_images(
 
 ---
 
-### 23.8 evaluation/main.py — Non-Negotiable Completeness
+### 23.8 code/evaluation/main.py — Non-Negotiable Completeness
 
-This file is what judges run. It must:
+This file is what judges run. It lives at `code/evaluation/main.py` (official
+structure). It must:
 
 ```python
-# evaluation/main.py — what it must do:
+# code/evaluation/main.py — what it must do:
 
 # 1. Load sample_claims.csv (20 known cases with ground truth)
 # 2. Run Strategy A (Claude Sonnet, single call) → collect metrics
@@ -3013,11 +3036,11 @@ This file is what judges run. It must:
 # 5. Pull exact token/cost/latency from OpenRouter generation API
 # 6. Compute accuracy vs ground truth for both strategies
 # 7. Print comparison table to console (rich Table)
-# 8. Write evaluation/report.json with all numbers
+# 8. Write code/evaluation/report.json with all numbers
 # 9. Exit with code 0
 
 # Must run without errors:
-#   python evaluation/main.py
+#   python code/evaluation/main.py
 ```
 
 The evaluation report is the primary technical execution artifact.
@@ -3045,9 +3068,9 @@ If it crashes, is empty, or produces no comparison — technical score tanks.
    python code/main.py
 
 4. Run evaluation (Strategy A vs B comparison):
-   python evaluation/main.py
+   python code/evaluation/main.py
 
-Output: output.csv (predictions) + evaluation/report.json (metrics)
+Output: output.csv (predictions) + code/evaluation/report.json (metrics)
 ```
 
 If setup takes more than 2 minutes, judges mark it down.
@@ -3127,8 +3150,8 @@ One variable. Clear instructions. No excuse for confusion.
 ### 23.12 Code Quality Checklist Before Submission
 
 ```
-[ ] python code/main.py           runs end-to-end without errors
-[ ] python evaluation/main.py     runs and produces report
+[ ] python code/main.py              runs end-to-end without errors
+[ ] python code/evaluation/main.py   runs and produces report
 [ ] No print() statements         (grep -r "print(" code/ should return 0)
 [ ] No bare except                (grep -r "except:" code/ should return 0)
 [ ] No hardcoded strings outside config.py
@@ -3498,7 +3521,7 @@ Claims requiring repair loop                   |   N   |    X%
 
 ### 25.6 Strategy A vs Strategy B Comparison Table
 
-Printed to console as a Rich table and written to `evaluation/report.json`:
+Printed to console as a Rich table and written to `code/evaluation/report.json`:
 
 ```
 Metric                      | Strategy A    | Strategy B
@@ -3533,10 +3556,10 @@ A8      | No repair loop        |  XX/20   | ±X       |   $X.XXX   |  XXXms
 
 ---
 
-### 25.8 evaluation/main.py — Required Structure
+### 25.8 code/evaluation/main.py — Required Structure
 
 ```python
-# evaluation/main.py
+# code/evaluation/main.py
 
 async def main() -> None:
     cfg = Config()
@@ -3566,14 +3589,14 @@ async def main() -> None:
     print_ablation_table(ablation_results, ground_truth)
 
     # Write report
-    write_report("evaluation/report.json", eval_a, eval_b, ablation_results)
-    log.info("Evaluation complete → evaluation/report.json")
+    write_report("code/evaluation/report.json", eval_a, eval_b, ablation_results)
+    log.info("Evaluation complete → code/evaluation/report.json")
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-Must exit with code 0, produce `evaluation/report.json`, and print a readable table.
+Must exit with code 0, produce `code/evaluation/report.json`, and print a readable table.
 If it crashes or produces empty output → technical score fails.
 
 ---
@@ -3912,7 +3935,7 @@ Ablation signal       A6 vs A0 (claim-first vs image-first prompt order)
                       image-first ordering genuinely changes model certainty
 ```
 
-The evaluation report (`evaluation/report.json`) tracks average confidence
+The evaluation report (`code/evaluation/report.json`) tracks average confidence
 per verdict class and per object type, so calibration drift can be detected
 across the sample set.
 
