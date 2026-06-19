@@ -185,6 +185,33 @@ The vision prompt explicitly teaches this framework to the model:
  NOT_ENOUGH_INFORMATION, not CONTRADICTED."
 ```
 
+**Justification must cite image IDs (official: "mention relevant image IDs when
+helpful").** The Stage 3 prompt instructs the model to name the specific images
+its verdict relies on, by their claim-local IDs:
+
+```
+"In claim_status_justification, when your decision relies on specific images,
+ name them by ID (img_1, img_2, ...). The IDs you cite in the justification
+ MUST be consistent with supporting_image_ids. Keep it concise and grounded in
+ what is visible.
+
+ Good:  'img_1 shows a clear dent on the rear bumper; img_2 is out of focus and
+         was not relied on.'   (supporting_image_ids = img_1)
+ Good (contradicted): 'img_1 shows the rear bumper intact with no visible dent.'
+ Avoid: 'The image shows damage.'  (no ID, not verifiable against the field)
+
+ Single-image claims need not belabor the ID, but MULTI-IMAGE and CONTRADICTED
+ cases should name which image carries the evidence."
+```
+
+This makes the prose verifiable against `supporting_image_ids` (a judge sees the
+justification names the same image the field cites) and satisfies the official
+"mention relevant image IDs when helpful" instruction. Consistency is checked in
+Stage 4b: if the justification names an `img_N` that is not in
+`supporting_image_ids` (or vice-versa for a relied-upon image), it is a soft
+warning, not a hard repair — the spec says "when helpful," so absence is allowed,
+but a CONTRADICTION between the two surfaces is flagged.
+
 ### 3.7 Severity Alignment with Verdict (corrected against ground truth)
 
 ```
@@ -265,6 +292,16 @@ claim_status = not_enough_information:
 An image may appear in `supporting_image_ids` even when `valid_image = false`
 (user_008: `valid_image=false`, `supporting_image_ids="img_1"`). The two fields
 are independent — see §3.9.
+
+**Semantics note (official wording): the field lists IDs "supporting the
+DECISION," not "proving the claim true."** For a `contradicted` verdict, the
+images that show the contradicting evidence DO support the decision and are
+listed here. `none` is used only when "no image is sufficient." This is why all
+five contradicted rows populate the field and only the truly image-less /
+unusable cases (user_006, user_032) are `none`.
+
+The IDs cited in `claim_status_justification` (§3.6) should be consistent with
+this field — the prose and the field reference the same evidentiary images.
 
 ---
 
