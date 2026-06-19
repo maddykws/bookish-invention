@@ -1374,7 +1374,369 @@ The ablation proving a component is unnecessary is itself a valuable finding.
 
 ---
 
-## 23. The Unknown Unknown Principle
+## 23. Technical Execution Standards
+
+Last attempt: 25/30 test cases, 3/30 technical execution.
+The output was correct. The code was judged poor quality.
+This section is the contract that prevents that from happening again.
+
+---
+
+### 23.1 The Seven Non-Negotiable Rules
+
+```
+Rule 1  Every data structure is a Pydantic model. No raw dicts passed between functions.
+Rule 2  Every function has full type hints. No untyped signatures anywhere.
+Rule 3  Rich console + Python logging module. Zero print() statements.
+Rule 4  One Config dataclass. Nothing hardcoded outside it.
+Rule 5  Specific except clauses only. No bare except or except Exception: pass.
+Rule 6  evaluation/main.py must be complete, runnable, and produce a report.
+        This is the most likely reason for 3/30 last time. Judges run it.
+Rule 7  README.md enables setup in under 2 minutes.
+        If they cannot run the system in 2 minutes, technical score drops.
+```
+
+---
+
+### 23.2 Pydantic Models for Everything
+
+All 14 output fields are typed and validated at the model level — not in ad-hoc code.
+
+```python
+from pydantic import BaseModel, field_validator
+from typing import Literal
+
+class ClaimOutput(BaseModel):
+    user_id: str
+    image_paths: str
+    claim_text: str
+    claim_object: Literal["car", "laptop", "package"]
+    evidence_standard_met: bool
+    evidence_standard_met_reason: str
+    risk_flags: str                    # semicolon-separated
+    issue_type: Literal[
+        "dent", "scratch", "crack", "glass_shatter", "broken_part",
+        "missing_part", "torn_packaging", "water_damage", "stain",
+        "none", "unknown"
+    ]
+    object_part: str
+    claim_status: Literal["supported", "contradicted", "not_enough_information"]
+    claim_status_justification: str
+    supporting_image_ids: str          # semicolon-separated or "none"
+    valid_image: str                   # semicolon-separated true/false per image
+    severity: Literal["none", "low", "medium", "high", "unknown"]
+
+    @field_validator("risk_flags")
+    def validate_risk_flags(cls, v: str) -> str:
+        valid = {
+            "blurry_image", "cropped_or_obstructed", "claim_mismatch",
+            "user_history_risk", "manual_review_required", "wrong_object",
+            "wrong_angle", "damage_not_visible", "non_original_image",
+            "text_instruction_present", "model_consensus_conflict", "none"
+        }
+        flags = [f.strip() for f in v.split(";") if f.strip()]
+        for flag in flags:
+            if flag not in valid:
+                raise ValueError(f"Invalid risk flag: {flag}")
+        return v
+```
+
+Input rows, preprocessed images, user history — all Pydantic models.
+Nothing flows between pipeline stages as a raw dict.
+
+---
+
+### 23.3 Single Config Dataclass
+
+```python
+# code/config.py — the only place any setting lives
+
+import os
+from dataclasses import dataclass, field
+
+@dataclass
+class Config:
+    # API
+    openrouter_api_key: str = field(
+        default_factory=lambda: os.environ["OPENROUTER_API_KEY"]
+    )
+    primary_model: str = "anthropic/claude-haiku-4-5"
+    strategy_a_model: str = "anthropic/claude-sonnet-4-6"
+    crosscheck_model_a: str = "google/gemini-2.5-flash"
+    crosscheck_model_b: str = "meta-llama/llama-3.2-11b-vision-instruct"
+
+    # Image preprocessing
+    resize_max_px: int = 768
+    blur_threshold: float = 100.0
+    clip_mismatch_threshold: float = 0.2
+
+    # Pipeline behaviour
+    temperature: float = 0.0
+    max_repair_attempts: int = 2
+    token_budget_per_claim: int = 2000
+    transcript_max_turns: int = 8
+    consensus_trigger_threshold: int = 2    # risk flags needed to trigger consensus
+
+    # Paths
+    claims_path: str = "dataset/claims.csv"
+    sample_claims_path: str = "dataset/sample_claims.csv"
+    user_history_path: str = "dataset/user_history.csv"
+    evidence_req_path: str = "dataset/evidence_requirements.csv"
+    output_path: str = "output.csv"
+    checkpoint_path: str = ".checkpoint"
+    log_path: str = "logs/pipeline.log"
+
+    # Ablation feature flags (all True = full Strategy B)
+    use_consensus: bool = True
+    use_local_vlm: bool = True
+    use_clip: bool = True
+    resize_images: bool = True
+    image_first_prompt: bool = True
+    fraud_checks: bool = True
+    use_repair_loop: bool = True
+
+CFG = Config()   # singleton — import this everywhere
+```
+
+---
+
+### 23.4 Logging — Rich + Python logging, Zero print()
+
+```python
+# code/utils/logger.py
+
+import logging
+import sys
+from pathlib import Path
+from rich.console import Console
+from rich.logging import RichHandler
+
+console = Console()
+
+def get_logger(name: str) -> logging.Logger:
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        Path("logs").mkdir(exist_ok=True)
+        # File handler — full detail
+        fh = logging.FileHandler("logs/pipeline.log")
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
+        ))
+        logger.addHandler(fh)
+        # Console handler — rich formatting
+        logger.addHandler(RichHandler(console=console, show_path=False))
+    return logger
+```
+
+Every module gets its own named logger:
+```python
+log = get_logger("pipeline.stage3")
+log.info("API call", extra={"claim_id": claim.user_id, "model": CFG.primary_model})
+log.warning("Repair triggered", extra={"attempt": 1, "error": "missing field"})
+log.error("Safe defaults applied", extra={"claim_id": claim.user_id})
+```
+
+---
+
+### 23.5 Type Hints on Every Function
+
+```python
+# Every function signature is fully typed. No exceptions.
+
+async def analyze_image(
+    image_path: Path,
+    claim: ClaimRow,
+    config: Config,
+) -> ImageAnalysisResult:
+    ...
+
+def detect_blur(image: Image.Image, threshold: float = 100.0) -> bool:
+    ...
+
+def compute_sha256(path: Path) -> str:
+    ...
+
+async def cross_check(
+    images: list[ProcessedImage],
+    claim: ClaimRow,
+    models: list[str],
+    config: Config,
+) -> list[CrossCheckResult]:
+    ...
+```
+
+---
+
+### 23.6 Specific Exception Handling
+
+```python
+# Bad — never do this:
+try:
+    result = await call_api(...)
+except:
+    pass
+
+# Good — every except names what it catches and why:
+from openai import APITimeoutError, RateLimitError, APIStatusError
+
+try:
+    result = await call_api(...)
+except APITimeoutError:
+    log.warning("API timeout — applying safe defaults", extra={"claim_id": claim_id})
+    return safe_defaults(claim)
+except RateLimitError:
+    log.warning("Rate limit hit — OpenRouter should route to fallback")
+    raise   # let OpenRouter fallback chain handle it
+except APIStatusError as e:
+    log.error("API error", extra={"status": e.status_code, "claim_id": claim_id})
+    return safe_defaults(claim)
+except json.JSONDecodeError as e:
+    log.warning("JSON parse failed — entering repair loop", extra={"error": str(e)})
+    return await repair_loop(raw_response, claim, config)
+```
+
+---
+
+### 23.7 Async Throughout — Parallel Image Processing
+
+```python
+# Bad — sequential (slow, looks amateur):
+for img_path in image_paths:
+    result = analyze_image(img_path, claim)
+    results.append(result)
+
+# Good — parallel (fast, professional):
+async def process_all_images(
+    image_paths: list[str],
+    claim: ClaimRow,
+    config: Config,
+) -> list[ImageAnalysisResult]:
+    tasks = [
+        analyze_image(Path(p), claim, config)
+        for p in image_paths
+    ]
+    return await asyncio.gather(*tasks, return_exceptions=False)
+```
+
+---
+
+### 23.8 evaluation/main.py — Non-Negotiable Completeness
+
+This file is what judges run. It must:
+
+```python
+# evaluation/main.py — what it must do:
+
+# 1. Load sample_claims.csv (20 known cases with ground truth)
+# 2. Run Strategy A (Claude Sonnet, single call) → collect metrics
+# 3. Run Strategy B (full cascade) → collect metrics
+# 4. For Strategy B: run minimum 3 ablations (A0 vs A2, A0 vs A5)
+# 5. Pull exact token/cost/latency from OpenRouter generation API
+# 6. Compute accuracy vs ground truth for both strategies
+# 7. Print comparison table to console (rich Table)
+# 8. Write evaluation/report.json with all numbers
+# 9. Exit with code 0
+
+# Must run without errors:
+#   python evaluation/main.py
+```
+
+The evaluation report is the primary technical execution artifact.
+If it crashes, is empty, or produces no comparison — technical score tanks.
+
+---
+
+### 23.9 README.md — Setup in Under 2 Minutes
+
+```markdown
+## Setup
+
+1. Clone and install:
+   pip install -r requirements.txt
+
+2. Set environment variable:
+   export OPENROUTER_API_KEY=your_key_here
+   (or copy .env.example → .env and fill it in)
+
+3. Run on full dataset:
+   python code/main.py
+
+4. Run evaluation (Strategy A vs B comparison):
+   python evaluation/main.py
+
+Output: output.csv (predictions) + evaluation/report.json (metrics)
+```
+
+If setup takes more than 2 minutes, judges mark it down.
+
+---
+
+### 23.10 requirements.txt — Complete and Pinned
+
+```
+# Core
+openai>=1.50.0          # OpenRouter uses OpenAI-compatible API
+pydantic>=2.7.0
+python-dotenv>=1.0.0
+
+# Image processing
+pillow>=10.0.0
+opencv-python>=4.9.0
+numpy>=1.26.0
+
+# Local models (optional — used if available)
+torch>=2.3.0
+torchvision>=0.18.0
+transformers>=4.40.0    # Qwen2-VL, Llama vision
+ultralytics>=8.2.0      # YOLO v8
+
+# CLI + logging
+rich>=13.7.0
+tqdm>=4.66.0
+
+# Data
+pandas>=2.2.0
+
+# Dev
+pytest>=8.0.0
+```
+
+---
+
+### 23.11 .env.example
+
+```
+# Copy to .env and fill in your key
+OPENROUTER_API_KEY=your_openrouter_api_key_here
+```
+
+One variable. Clear instructions. No excuse for confusion.
+
+---
+
+### 23.12 Code Quality Checklist Before Submission
+
+```
+[ ] python code/main.py           runs end-to-end without errors
+[ ] python evaluation/main.py     runs and produces report
+[ ] No print() statements         (grep -r "print(" code/ should return 0)
+[ ] No bare except                (grep -r "except:" code/ should return 0)
+[ ] No hardcoded strings outside config.py
+[ ] All functions have type hints
+[ ] All Pydantic models validate their enums
+[ ] requirements.txt installs cleanly in a fresh venv
+[ ] README.md setup works in under 2 minutes
+[ ] output.csv has exactly 14 columns with correct headers
+[ ] .env.example exists with OPENROUTER_API_KEY
+[ ] logs/ directory is created on first run (not committed)
+[ ] checkpoint file enables resume after interruption
+[ ] temperature=0 set on all API calls
+```
+
+---
+
+## 24. The Unknown Unknown Principle
 
 > No enumeration of test cases is complete.
 > Real users will submit inputs that no designer anticipated.
