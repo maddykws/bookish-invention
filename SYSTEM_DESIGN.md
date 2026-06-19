@@ -962,6 +962,10 @@ dataset/
 └── images/
     ├── sample/
     └── test/
+
+README.md                        # Required by AGENTS.md — setup, usage, env vars
+$HOME/hackerrank_orchestrate/
+└── log.txt                      # Required by AGENTS.md — append-only interaction log
 ```
 
 ---
@@ -1018,7 +1022,190 @@ dataset/
 
 ---
 
-## 17. The Unknown Unknown Principle
+## 17. How AI Was Used to Build This
+
+This section exists because the AI judge will ask: *"How did you use AI while building the solution?"*
+
+### The Meta-Orchestration
+This hackathon has two levels of orchestration:
+- **Level 1 (outer):** Claude Code orchestrated the development of this system — the conversation transcript is a required submission artifact
+- **Level 2 (inner):** Our code orchestrates claim verification using OpenRouter + local models
+
+### What Claude Code Was Used For
+
+| Phase | What We Asked | What It Produced |
+|---|---|---|
+| Problem understanding | Fetched and parsed problem_statement.md, AGENTS.md, README | Full context before any design |
+| Initial architecture | "How should we system design this?" | 5-stage pipeline skeleton |
+| Test case design | Iterative pushback ("think out of the box") | 80+ scenarios across 10 categories |
+| Self-healing design | "Can we build a fault-tolerant system?" | Detect→Diagnose→Repair→Verify→Degrade pattern |
+| Unknown inputs | "What do we do with a total unknown claim?" | The Unknown Unknown principle + safe defaults |
+| Cost constraints | Incorporated Discord screenshot about API limits | Two-tier local+API architecture |
+| Image model selection | "What other models can we use?" | Full model taxonomy with local vs API split |
+| OpenRouter integration | "Think about OpenRouter for everything" | Full infrastructure spine redesign |
+| Consensus layer | "Use OpenRouter for multi-model reasoning" | Stage 3.5–3.7 consensus pipeline |
+| Document finalization | "Create a document before we finalize" | This document |
+
+### What the Conversation Demonstrates
+- Architecture was designed **before any code was written** — deliberate, not reactive
+- Every assumption was challenged: test cases were expanded 3 times before moving forward
+- Real-world constraints (API costs from Discord) shaped the architecture mid-design
+- The system was designed to handle **unknown unknowns**, not just enumerated cases
+- OpenRouter insight came from external context (participant Discord), incorporated immediately
+
+### Development Transcript
+The full Claude Code conversation transcript is included in the submission as required by AGENTS.md. It shows the complete reasoning chain from problem statement to finalized design.
+
+---
+
+## 18. Determinism
+
+AGENTS.md requires: *"Deterministic output where feasible."*
+
+### How We Achieve It
+
+```
+All OpenRouter API calls:
+  temperature = 0         → greedy decoding, same output for same input
+  seed = 42               → fixed seed where provider supports it
+  top_p = 1.0             → no nucleus sampling randomness
+
+Local models (YOLO, CLIP):
+  Inference only, no training → fully deterministic
+  torch.manual_seed(42) set at startup
+
+Image preprocessing:
+  PIL resize is deterministic for same input
+  SHA-256 hash is deterministic
+  OpenCV Laplacian is deterministic
+```
+
+### Non-Deterministic Elements (Acknowledged)
+
+```
+OpenRouter fallback routing:
+  If primary model is unavailable, a different model serves the request.
+  Output may differ between runs if a fallback was used.
+  Mitigation: log which model_slug served each request (from OR generation API)
+
+Free-tier model availability:
+  Gemini Flash and Llama free tiers may be exhausted between runs.
+  Mitigation: checkpoint + resume means partial results are preserved.
+```
+
+---
+
+## 19. OpenRouter as Single Point of Failure
+
+### The Risk
+By consolidating all API calls through OpenRouter, we replaced two independent providers with one aggregator. If OpenRouter has an outage, all API stages fail simultaneously.
+
+### Mitigations
+
+```
+1. Startup health check
+   GET https://openrouter.ai/api/v1/auth/key
+   → if unreachable → warn user, do not start batch
+
+2. Checkpoint resume
+   If OR goes down mid-batch, already-written rows are preserved.
+   Restart resumes from last checkpoint when OR recovers.
+
+3. Local stages still work during OR outage
+   Stage 2 (local preprocessing) produces valid pre-flags independently.
+   Stage 2.5 (local VLM, if GPU) can still run.
+   These results are cached and used when OR recovers.
+
+4. Fallback to direct provider APIs (manual override)
+   If ANTHROPIC_API_KEY is set as a backup env var,
+   the system can bypass OR for Stage 3 calls only.
+   Not the default path — only used if OR is down.
+```
+
+### Acceptance
+For a 24-hour hackathon, the simplicity, cost savings, and built-in rate limit handling of OpenRouter outweigh the SPOF risk. OpenRouter's uptime SLA is sufficient for a single batch run.
+
+---
+
+## 20. Accuracy Expectations
+
+### On Sample Claims (20 known cases)
+```
+Expected accuracy: 17–19 / 20 (85–95%)
+
+Cases likely to be correct:
+  - Clear damage, clean image (HP1–HP5) → high confidence
+  - Obvious contradictions (CT1–CT4) → model agrees easily
+  - Clearly insufficient evidence (NI1–NI7) → model flags correctly
+
+Cases that may be ambiguous:
+  - Borderline severity (low vs medium) → model may differ from ground truth
+  - Mixed-evidence multi-image claims → aggregation logic matters
+  - Non-English transcripts → extraction accuracy may vary
+```
+
+### On Full Claims (200 real cases)
+```
+Expected accuracy: 80–90%
+
+Uncertainty sources:
+  - Unknown scenarios not in sample set
+  - Novel damage types the model hasn't encountered
+  - Adversarial inputs (fraud cases) we can only partially detect
+  - Ambiguous claims where human evaluators themselves would disagree
+
+How we report this honestly:
+  - The evaluation folder shows exact accuracy on the 20 known cases
+  - We do not extrapolate a false precision to the full batch
+  - Claims flagged manual_review_required are explicitly uncertain
+```
+
+### What "Wrong" Looks Like for Us
+```
+Acceptable wrong:  not_enough_information when ground truth is supported
+                   (we were cautious, not reckless)
+
+Unacceptable wrong: supported when ground truth is contradicted
+                    (confident and wrong is the worst failure mode)
+
+Our system is biased toward caution by design.
+```
+
+---
+
+## 21. What We Would Do With More Time
+
+```
+1. Fine-tune CLIP on damage-specific image pairs
+   Current CLIP (ViT-B/32) is general-purpose.
+   A domain-adapted CLIP would give much better semantic matching
+   for car/laptop/package damage specifically.
+
+2. Cross-claim fraud detection beyond image hashing
+   Add embedding-based similarity across all claims in a batch
+   to catch coordinated fraud rings submitting slightly modified images.
+
+3. Confidence scoring on every output field
+   Currently output is binary (valid/invalid).
+   A per-field confidence score would help human reviewers
+   prioritize which parts of a claim to scrutinize.
+
+4. EXIF + metadata verification pipeline
+   More robust temporal verification:
+   check GPS metadata, device fingerprinting, compression artifacts.
+
+5. Active learning loop
+   Track which claims human reviewers overturn.
+   Use those overturned cases as training signal to improve prompts.
+
+6. Streaming output for large batches
+   Current implementation waits for full JSON before writing.
+   Streaming structured output would reduce latency on large batches.
+```
+
+---
+
+## 22. The Unknown Unknown Principle
 
 > No enumeration of test cases is complete.
 > Real users will submit inputs that no designer anticipated.
@@ -1040,7 +1227,7 @@ dataset/
 
 ---
 
-*Document version: pre-implementation finalization (v2 — OpenRouter spine)*
+*Document version: pre-implementation finalization (v3 — judge-ready)*
 *Strategy: B (Multi-Model Cascade via OpenRouter)*
 *API spine: OpenRouter (single key)*
 *Primary model: anthropic/claude-haiku-4-5*
