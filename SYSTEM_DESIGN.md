@@ -2790,7 +2790,225 @@ This is why L2 matters: it makes the ablation study feasible without burning bud
 
 ---
 
-## 27. The Unknown Unknown Principle
+## 27. Confidence Scoring and Escalation
+
+The system never makes a high-stakes verdict without knowing how certain it is.
+Confidence drives escalation. Low confidence triggers cross-checks.
+Persistent low confidence forces human review.
+
+---
+
+### 27.1 What Every Model Must Return
+
+Every LLM call in Stage 3 and Stage 3.6 must return a `confidence` field.
+This is added to the prompt schema for all three models.
+
+```json
+{
+  "claim_status":       "supported",
+  "confidence":         0.82,
+  "severity":           "medium",
+  "issue_type":         "dent",
+  "reasoning_summary":  "Rear bumper clearly visible; dent shape and depth match claimed impact damage."
+}
+```
+
+`confidence` is a float 0.0–1.0.
+The model is instructed: *"How certain are you that this verdict is correct given only the visual evidence provided?"*
+
+Stage 3 (Sonnet 4.6) returns the full 14-field output plus confidence.
+Stages 3.6 cross-checkers (Gemini, Llama) return the 4-field mini-schema above — enough to participate in consensus without generating a redundant full output.
+
+---
+
+### 27.2 Four-Tier Escalation Ladder
+
+Confidence from the primary model (Sonnet 4.6) determines which tier fires.
+All decisions are local — no extra tokens spent at the gate itself.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  TIER 0 — Fast path, no cross-check                            │
+│                                                                 │
+│  Conditions (ALL must be true):                                 │
+│    confidence ≥ 0.85                                           │
+│    no hedging language in justification                        │
+│    fewer than 2 risk flags                                     │
+│    Stage 2.5 local VLM did not say "unclear"                   │
+│                                                                 │
+│  Action: accept primary verdict, skip Stage 3.6               │
+│  Expected: ~70% of clean, unambiguous claims                   │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  TIER 1 — Soft escalation                                       │
+│                                                                 │
+│  Triggers (ANY):                                                │
+│    confidence 0.60–0.84                                        │
+│    hedging language in justification                           │
+│    2+ risk flags present                                       │
+│    CLIP score < 0.2 (pre-flagged in Stage 2)                  │
+│    local VLM said "unclear"                                    │
+│                                                                 │
+│  Action: trigger Stage 3.6 cross-check                        │
+│                                                                 │
+│  Outcome after consensus:                                       │
+│    Models agree + weighted confidence ≥ 0.70  → accept        │
+│    Models agree + weighted confidence < 0.70  → accept        │
+│                                                 + manual_review_required
+│    Models disagree                            → not_enough_information
+│                                                 + manual_review_required
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  TIER 2 — Hard escalation                                       │
+│                                                                 │
+│  Triggers (ANY):                                                │
+│    confidence < 0.60                                           │
+│    claim_status = not_enough_information from primary          │
+│    CLIP score < 0.2 AND local VLM = "unclear" (both)          │
+│                                                                 │
+│  Action: trigger Stage 3.6 + set manual_review_required STICKY │
+│                                                                 │
+│  The sticky flag means: even if consensus reaches agreement    │
+│  and confidence rises, manual_review_required does not clear.  │
+│  The system produced a verdict but flags it for human review.  │
+│                                                                 │
+│  Justification template:                                        │
+│  "Primary model confidence was low (X%). Cross-check [agreed / │
+│   partially agreed / disagreed]. Human review recommended."    │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  TIER 3 — Escalation ceiling                                    │
+│                                                                 │
+│  Triggers (ANY):                                                │
+│    All three models disagree on claim_status                   │
+│    All three models confidence < 0.50                          │
+│                                                                 │
+│  Action: forced terminal state — no further API calls          │
+│    claim_status = not_enough_information                       │
+│    risk_flags  += [manual_review_required,                     │
+│                    model_consensus_conflict]                    │
+│    confidence   = 0.0                                          │
+│                                                                 │
+│  Justification template:                                        │
+│  "Models reached no consensus:                                 │
+│   Sonnet=[supported, 0.45] Gemini=[contradicted, 0.38]        │
+│   Llama=[not_enough_information, 0.52]                        │
+│   Insufficient collective evidence to determine verdict."      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 27.3 Confidence Aggregation Formula
+
+When models agree on the same `claim_status`, compute a weighted confidence score.
+Sonnet 4.6 carries the highest weight as the primary reasoning model.
+
+```python
+MODEL_WEIGHTS: dict[str, float] = {
+    "sonnet":  0.50,   # primary model — strongest visual reasoning
+    "gemini":  0.30,   # secondary cross-checker
+    "llama":   0.20,   # tertiary cross-checker
+}
+
+def aggregate_confidence(
+    sonnet_conf: float,
+    gemini_conf: float | None,
+    llama_conf:  float | None,
+) -> float:
+    """
+    Compute weighted confidence when models agree on verdict.
+    If a cross-checker is unavailable (None), redistribute its weight to Sonnet.
+    """
+    total_weight = MODEL_WEIGHTS["sonnet"]
+    score = sonnet_conf * MODEL_WEIGHTS["sonnet"]
+
+    if gemini_conf is not None:
+        score        += gemini_conf * MODEL_WEIGHTS["gemini"]
+        total_weight += MODEL_WEIGHTS["gemini"]
+
+    if llama_conf is not None:
+        score        += llama_conf  * MODEL_WEIGHTS["llama"]
+        total_weight += MODEL_WEIGHTS["llama"]
+
+    return score / total_weight   # normalise if a model was unavailable
+```
+
+When models **disagree** — weighted confidence is not computed.
+Confidence is forced to `0.0` and verdict forced to `not_enough_information`.
+You cannot have collective confidence when you have no collective verdict.
+
+---
+
+### 27.4 Confidence in the Final Output
+
+The 14-field output schema (`ClaimOutput`) does not have a `confidence` field — that is an internal pipeline signal, not a required output column.
+
+Confidence surfaces in the output indirectly through:
+
+```
+High confidence (Tier 0)    → clean justification, no flags
+Medium confidence (Tier 1)  → justification notes partial uncertainty
+Low confidence (Tier 2)     → manual_review_required flag set
+No consensus (Tier 3)       → model_consensus_conflict + manual_review_required
+```
+
+Internal pipeline metadata (confidence scores, tier reached, aggregated score) is written to the per-claim metrics JSON for evaluation — not to `output.csv`.
+
+---
+
+### 27.5 Calibration Caveat
+
+LLM self-reported confidence scores are not statistically calibrated.
+A model outputting `confidence=0.9` does not mean it is correct 90% of the time.
+
+What the scores reliably provide:
+
+```
+Relative signal       0.9 vs 0.4 is a meaningful difference
+                      even if neither absolute value is accurate
+
+Escalation trigger    Useful for "should we get a second opinion?"
+                      The threshold is a policy choice, not a probability claim
+
+Transparency artifact The human reviewer sees how certain the system was
+                      and can calibrate their own trust accordingly
+
+Ablation signal       A6 vs A0 (claim-first vs image-first prompt order)
+                      will show whether confidence scores shift when
+                      anchoring bias is introduced — validating that
+                      image-first ordering genuinely changes model certainty
+```
+
+The evaluation report (`evaluation/report.json`) tracks average confidence
+per verdict class and per object type, so calibration drift can be detected
+across the sample set.
+
+---
+
+### 27.6 Thresholds in Config
+
+All thresholds live in the single `Config` dataclass — never hardcoded.
+
+```python
+@dataclass
+class Config:
+    # Confidence escalation thresholds
+    confidence_tier0_threshold: float = 0.85   # fast path — no cross-check
+    confidence_tier1_lower:     float = 0.60   # soft escalation lower bound
+    confidence_tier2_threshold: float = 0.60   # hard escalation trigger
+    confidence_tier3_threshold: float = 0.50   # all-models floor → terminal state
+    consensus_confidence_gate:  float = 0.70   # post-consensus acceptance threshold
+```
+
+Tunable without touching pipeline code.
+
+---
+
+## 28. The Unknown Unknown Principle
 
 > No enumeration of test cases is complete.
 > Real users will submit inputs that no designer anticipated.
