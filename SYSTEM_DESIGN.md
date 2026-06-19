@@ -429,14 +429,18 @@ class ProcessedImage(BaseModel):
   → claim_status = not_enough_information
 
 1 image:
-  → REQ_GENERAL_MULTI_IMAGE does not apply
-  → single image must satisfy all applicable requirements
+  → the single image must satisfy all applicable requirements
 
 2+ images:
-  → REQ_GENERAL_MULTI_IMAGE applies
-  → at least ONE must satisfy requirements
+  → the multi-image rule applies (whatever its requirement_id) — at least ONE
+    image must satisfy requirements
   → blurry/invalid images flagged but batch continues
 ```
+
+(The multi-image rule is matched by `select_requirements()` via its catch-all
+`claim_object`/`applies_to`, not by a hardcoded ID — see §4.4. The 1-vs-2+
+arithmetic lives in the §3.4 aggregation rules and Stage 3's reading of
+`minimum_image_evidence`.)
 
 ---
 
@@ -515,49 +519,82 @@ def history_preflag(history: UserHistory | None) -> list[str]:
 
 **Source:** `evidence_requirements.csv` — loaded once at startup
 
+**Official schema (confirmed):**
+```
+requirement_id          identifier for the rule
+claim_object            car, laptop, package, or all
+applies_to              issue family, such as "dent or scratch"
+minimum_image_evidence  minimum visual evidence needed to evaluate that claim
+```
+
 **Pydantic model:**
 ```python
 class EvidenceRequirement(BaseModel):
     requirement_id: str
     claim_object: str       # "all", "car", "laptop", "package"
-    applies_to: str         # "dent or scratch", "multi-image rows", etc.
+    applies_to: str         # issue family, e.g. "dent or scratch" (or a catch-all)
     minimum_image_evidence: str
 ```
 
-**Selection logic — which REQ_* apply to this claim:**
+**Selection logic — DATA-DRIVEN, not requirement_id-driven.**
+The official schema only guarantees the *meaning* of `claim_object` and
+`applies_to`. It does NOT guarantee any particular `requirement_id` value.
+Earlier drafts hardcoded `REQ_GENERAL_OBJECT_PART` / `REQ_GENERAL_MULTI_IMAGE` /
+`REQ_REVIEW_TRUST`; if the real file names its rows differently (`REQ_01`,
+`CAR_DENT`, …) every one of those branches silently never fires and the
+evidence-standard gate evaluates against an empty rule set. So selection keys
+ONLY off the two columns whose semantics are guaranteed:
+
 ```python
+# Values that mean "applies to everything" in either column.
+_CATCH_ALL = {"all", "any", "", "*", "general"}
+
 def select_requirements(
     claim_object: str,
     issue_family: str,
-    image_count: int,
     all_requirements: list[EvidenceRequirement],
 ) -> list[EvidenceRequirement]:
-    selected = []
+    """Select by guaranteed columns (claim_object + applies_to). ID-agnostic.
+
+    A requirement applies when:
+      (object matches OR object is a catch-all)
+      AND
+      (issue_family matches applies_to OR applies_to is a catch-all)
+    """
+    selected: list[EvidenceRequirement] = []
+    obj = claim_object.strip().lower()
+    fam = issue_family.strip().lower()
     for req in all_requirements:
-        # Always include general requirements
-        if req.requirement_id in ("REQ_GENERAL_OBJECT_PART", "REQ_REVIEW_TRUST"):
-            selected.append(req)
+        req_obj = req.claim_object.strip().lower()
+        if req_obj not in _CATCH_ALL and req_obj != obj:
             continue
-        # Multi-image requirement only when >1 image
-        if req.requirement_id == "REQ_GENERAL_MULTI_IMAGE":
-            if image_count > 1:
-                selected.append(req)
-            continue
-        # Object-specific: match claim_object
-        if req.claim_object != claim_object:
-            continue
-        # Issue-specific: check if issue_family matches applies_to
-        if _issue_matches(issue_family, req.applies_to):
+        if _applies(fam, req.applies_to):
             selected.append(req)
     return selected
 
-def _issue_matches(issue_family: str, applies_to: str) -> bool:
-    applies_to_lower = applies_to.lower()
-    return any(
-        keyword in applies_to_lower
-        for keyword in issue_family.lower().split("_")
-    )
+def _applies(issue_family: str, applies_to: str) -> bool:
+    a = applies_to.strip().lower()
+    if a in _CATCH_ALL:
+        return True                      # general rule → always applies
+    if issue_family in ("", "unknown"):
+        return False                     # unknown issue → only catch-alls apply
+    # Keyword overlap: "dent or scratch" matches issue_family "dent".
+    fam_tokens = set(issue_family.replace("-", "_").split("_"))
+    a_tokens = set(re.findall(r"[a-z]+", a))
+    return bool(fam_tokens & a_tokens)
 ```
+
+**Note on multi-image requirements.** Earlier drafts treated `applies_to =
+"multi-image rows"` as a special value and passed `image_count` into selection.
+The official schema describes `applies_to` as an *issue family*, so a
+multi-image rule is most likely encoded as a `claim_object="all"` /
+catch-all `applies_to` row (it then applies to every claim, and the
+*content* of `minimum_image_evidence` — e.g. "at least one clear image; if
+multiple, at least one must be in focus" — is interpreted by Stage 3, not by a
+numeric gate in selection). `select_requirements()` therefore no longer takes
+`image_count`. Multi-image arithmetic lives in the §3.4 aggregation rules and in
+Stage 3's reading of `minimum_image_evidence`, not in requirement selection.
+→ Confirm the real encoding when the file lands (Dataset Landing Checklist §6).
 
 **Note — the chicken-and-egg problem:**
 ```
@@ -571,7 +608,8 @@ Resolution:
 
 If Stage 1 cannot extract issue_family:
   → issue_family = "unknown"
-  → Only REQ_GENERAL_* apply (safe minimum)
+  → only catch-all requirements (claim_object="all" / applies_to catch-all)
+    apply — the safe minimum
 ```
 
 ---
@@ -1975,9 +2013,16 @@ Fail fast with a clear error, not a silent wrong output.
 
 ## 10. Evidence Requirements Mapping
 
-From `evidence_requirements.csv` — loaded at startup, checked locally in Stage 4b:
+From `evidence_requirements.csv` — loaded at startup, checked locally in Stage 4b.
 
-| Req ID | Applies To | Fails When |
+> ⚠️ **The `Req ID` values below are ILLUSTRATIVE, not authoritative.** They were
+> invented before the real file was available. `select_requirements()` is
+> data-driven and matches on `claim_object` + `applies_to` only (§4.4) — it does
+> NOT depend on these exact IDs. When the real file lands, replace this table
+> with the actual rows (Dataset Landing Checklist §6); no code changes needed if
+> the column semantics hold.
+
+| Req ID (illustrative) | Applies To | Fails When |
 |---|---|---|
 | REQ_GENERAL_OBJECT_PART | All claims | Relevant part not visible at all |
 | REQ_GENERAL_MULTI_IMAGE | Multi-image rows | No single image shows the claimed part clearly |
@@ -1997,10 +2042,10 @@ From `evidence_requirements.csv` — loaded at startup, checked locally in Stage
 
 | Field | Type | Allowed Values |
 |---|---|---|
-| `user_id` | string | From input |
-| `image_paths` | string | From input |
-| `claim_text` | string | Extracted from transcript |
-| `claim_object` | string | car, laptop, package |
+| `user_id` | string | From input (echoed verbatim) |
+| `image_paths` | string | From input (echoed verbatim) |
+| `user_claim` | string | From input (echoed verbatim — column is `user_claim`, NOT `claim_text`) |
+| `claim_object` | string | car, laptop, package (echoed verbatim) |
 | `evidence_standard_met` | boolean | true, false |
 | `evidence_standard_met_reason` | string | Free text explanation |
 | `risk_flags` | string | Semicolon-separated list |

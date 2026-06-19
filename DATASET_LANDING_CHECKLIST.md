@@ -72,11 +72,26 @@ Expected (confirm against real header):
 
 - [ ] `requirement_id`
 - [ ] `claim_object`      (`all` / `car` / `laptop` / `package`)
-- [ ] `applies_to`        (e.g. `dent or scratch`, `multi-image rows`)
+- [ ] `applies_to`        (issue family, e.g. `dent or scratch`)
 - [ ] `minimum_image_evidence`
-- [ ] Confirm the actual `requirement_id` values (e.g. `REQ_GENERAL_OBJECT_PART`,
-      `REQ_GENERAL_MULTI_IMAGE`, `REQ_REVIEW_TRUST`) match what
-      `select_requirements()` hardcodes. Update the selection logic if not.
+
+Selection is now DATA-DRIVEN (keyed on `claim_object` + `applies_to`, NOT on
+hardcoded requirement_id values) — see SYSTEM_DESIGN §4.4. Still confirm:
+
+- [ ] List the actual `requirement_id` values — confirm no logic depends on a
+      specific ID string (selection should be ID-agnostic).
+- [ ] List the distinct `applies_to` values — confirm they are issue families
+      (dent, scratch, crack, water_damage, …) and identify the catch-all
+      convention (`all` / `any` / blank). Update `_CATCH_ALL` if the file uses
+      a different sentinel.
+- [ ] **Multi-image encoding:** determine HOW a multi-image requirement is
+      expressed. Hypothesis: a `claim_object="all"` / catch-all `applies_to`
+      row whose `minimum_image_evidence` text describes the multi-image rule.
+      If instead `applies_to` literally contains `"multi-image rows"` (a
+      non-issue-family value), revisit `_applies()` and §3.4 handling.
+- [ ] Confirm the keyword-overlap matcher (`_applies`) correctly maps each real
+      `issue_family` Stage 1 emits to the right `applies_to` row (spot-check a
+      few: dent→"dent or scratch", water_damage→?, torn_packaging→?).
 
 ## 7. Ground-truth value vocabularies (calibrate, don't assume)
 
