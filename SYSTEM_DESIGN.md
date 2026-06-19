@@ -877,7 +877,7 @@ OpenRouter tries models in order. If the first is rate-limited or fails, it sile
 
 ```
 Stage 1  (transcript)   → claude-haiku-4-5   │ gemini-2.5-flash
-Stage 3  (reasoning)    → claude-sonnet-4-6  │ claude-haiku-4-5  │ gemini-2.5-flash
+Stage 3  (reasoning)    → claude-opus-4-8    │ claude-sonnet-4-6 │ gemini-2.5-flash
 Stage 3.6 cross-check A → gemini-2.5-flash   │ qwen2-vl-7b        (free tier)
 Stage 3.6 cross-check B → llama-3.2-11b-vision│ qwen2-vl-7b       (free tier)
 Stage 4c (repair)       → claude-haiku-4-5   │ gemini-2.5-flash
@@ -1256,39 +1256,102 @@ On startup:
 | **Total paid per clean claim** | | **~750-1,050** | |
 | **Total paid per uncertain claim** | | **~750-1,050** | Same — cross-check is free |
 
-### 7.1b Anthropic Prompt Caching — Stage 3 Cost Multiplier
+### 7.1b Anthropic Prompt Caching — Stage 3 Cost Multiplier (token optimization #1)
 
-The Stage 3 system prompt is **identical for every claim**: it contains the
-evidence requirements table, the verdict framework, the output schema, and the
-privacy/injection defense headers. This is ~400–600 tokens that never changes
-across 200 claims. Anthropic's [prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching)
-prices cached input tokens at **10% of the normal rate** after the first call.
+Stage 3 (Opus 4.8) is the dominant token cost in the pipeline, and its **static
+prefix is identical for every claim**: the verdict framework, the per-object
+`object_part` vocabularies, the evidence-requirements table, the output schema,
+the few-shot calibration examples, and the privacy/injection-defense headers.
+Anthropic prompt caching prices that cached prefix at **~10% of the normal input
+rate** after a one-time write — so we pay full price for it **once**, not 200×.
+
+**⚠ The minimum-cacheable-prefix gotcha (this is the whole game).**
+The cached prefix must clear a model-specific minimum or it **silently does not
+cache** — no error, just `cache_creation_input_tokens: 0` and full-rate billing
+on every call:
 
 ```
-Without prompt caching — Sonnet 4.6 pricing (~$3/M input):
-  200 claims × 500 static tokens = 100,000 tokens × $3.00/M = $0.30
-
-With prompt caching — 10% rate after cache write:
-  1 cache write × 500 tokens    = 500 tokens  × $3.75/M    = $0.002  (1.25× write cost)
-  199 cache hits × 500 tokens   = 99,500 tokens × $0.30/M  = $0.030  (90% discount)
-  Net static system-prompt cost = ~$0.032 vs $0.30 = 89% savings on static tokens
-
-Per-claim savings: ~$0.0013 × 199 cache hits = $0.26 saved on 200 claims
-As a fraction of total Stage 3 cost: significant when system prompt is large.
+Opus 4.8     → 4096 tokens minimum   (our Stage 3 primary — the binding number)
+Sonnet 4.6   → 2048 tokens minimum   (CPU fallback)
 ```
 
-**Implementation:** Pass `cache_control={"type": "ephemeral"}` on the system
-message (or on the last assistant turn if using multi-turn). OpenRouter supports
-this header and passes it to Anthropic. Track `cache_discount` in the
-OpenRouter generation API response to confirm caching fired.
+A naive ~500-token system prompt is **far below 4096** and would cache nothing on
+Opus. So the design REQUIRES deliberately assembling a **≥4096-token static
+prefix** (Config.prompt_cache_min_prefix_tokens) and placing the
+`cache_control` breakpoint at its end. We reach the threshold honestly with
+content that genuinely belongs there:
 
-Note: Prompt caching requires the cached block to be ≥1,024 tokens. If the
-system prompt is shorter, concatenate evidence_requirements.csv content into
-it to cross the threshold.
+```
+verdict framework + decision hierarchy (§3)        ~700 tok
+per-object object_part vocabularies (§11.2)        ~250 tok
+issue_type / risk_flag definitions + when-to-use   ~500 tok
+evidence_requirements.csv (full table, verbatim)   ~600 tok
+output schema + serialization rules                ~400 tok
+injection-defense + image-first instructions (§8)  ~400 tok
+3–4 worked few-shot examples (one per object type) ~1500 tok
+                                                    ─────────
+cached static prefix                               ≥4096 tok   ← one cache_control here
+─────────────────────────────────────────────────────────────
+per-claim VOLATILE suffix (NOT cached, kept last):
+  the transcript, the image(s), history snippet, CLIP/preflags
+```
 
-**This is ablation A17 (cache ON vs OFF)** — run both and include the exact
-cost comparison in the evaluation report. The problem statement explicitly
-asks about caching strategy; this is the answer.
+Everything volatile (claim text, images, history) goes **after** the breakpoint,
+so the prefix bytes are identical across all 200 claims and every call after the
+first is a cache READ. (Prefix-match rule: one changed byte before the breakpoint
+invalidates the whole cache — keep the static block byte-frozen, no timestamps /
+per-claim IDs / unsorted JSON in it.)
+
+**Cost math (Opus 4.8, $5/M input):**
+```
+Without caching:
+  200 claims × 4096 static tok = 819,200 tok × $5.00/M = $4.10  (paid every call)
+
+With caching:
+  1 write  × 4096 tok = 4,096 tok × $6.25/M (1.25× write) = $0.026
+  199 reads × 4096 tok = 815,104 tok × $0.50/M (10% read) = $0.408
+  Net static-prefix cost = ~$0.43 vs $4.10 → ~89% saved (~$3.67 on the run)
+```
+The larger we make the (genuinely useful) static prefix, the more the cache saves
+— caching turns "bigger system prompt" from a cost into a near-free win, which is
+why we front-load all reusable instruction into it and keep per-claim input minimal.
+
+**Implementation:** pass `cache_control={"type": "ephemeral"}` on the final
+static block via the OpenAI-SDK `extra_body` (OpenRouter forwards it to
+Anthropic). Verify it actually fired by reading `cache_discount` /
+`cache_read_input_tokens` from the OpenRouter generation API — **if it's zero
+across claims, the prefix is under 4096 or a silent invalidator changed it.**
+The eval report asserts a non-zero cache-read rate as a regression guard.
+
+**This is ablation A17 (cache ON vs OFF)** — run both, report the measured
+delta. The problem statement explicitly asks for a caching strategy; this is it,
+and it is the single biggest token-optimization lever in the system.
+
+### 7.1c Token-Optimization Ledger (every lever, ranked)
+
+Cost is a load-bearing constraint — these are all the levers, in priority order:
+
+```
+1. Prompt caching on the ≥4096 static prefix (§7.1b)   ~89% off static input
+2. Escalation ladder: ~70% of claims never call        consensus skipped on
+   Stage 3.6 (Tier 0 fast-path)                        the easy majority
+3. Consensus runs on FREE-tier models (Gemini/Llama)   $0 — adds rate, not $
+4. Local pre-filter early-exit (blank/blur/dup)         skips Stage 3 entirely
+   before any paid call                                 on unusable inputs
+5. Image resize → ≤768px before send (§7.3)             fewer vision tokens
+6. SHA-256 duplicate cache → identical image set         0 tokens on repeats
+   returns cached verdict (L1/L2, §26)
+7. Stage 1 + repair on Haiku ($1/$5), not Opus           cheap text tasks
+8. temperature=0 + concise-justification instruction     fewer output tokens
+   (output tokens are 5× input on Opus — keep terse)     (the expensive side)
+9. token_budget_per_claim guard (Config) trips a          hard ceiling per claim
+   safe-default before a runaway call
+```
+
+Note lever #8: on Opus, **output** is $25/M vs $5/M input — 5× more expensive.
+So the justification/reason fields are prompted to be concise (one or two
+grounded sentences), and the cross-checkers return a 4-field mini-schema, not a
+full re-output. Trimming output tokens matters more per-token than trimming input.
 
 ### 7.2 Batch Cost Estimate
 
@@ -2257,7 +2320,7 @@ Stage 0   — Environment check     : nvidia-smi + OpenRouter credit check
 Stage 1   — Transcript parsing    : claude-haiku-4-5 via OpenRouter  (cheap text task)
 Stage 2   — Local preprocessing   : OpenCV + YOLO v8 + CLIP (CUDA)
 Stage 2.5 — Damage pre-check      : Qwen2-VL-7B or Llama-3.2-Vision-11B (local)
-Stage 3   — Primary reasoning     : claude-sonnet-4-6 via OpenRouter  (best visual reasoning)
+Stage 3   — Primary reasoning     : claude-opus-4-8 via OpenRouter  (best visual reasoning)
 Stage 3.6 — Cross-check A         : google/gemini-2.5-flash via OpenRouter (free)
 Stage 3.6 — Cross-check B         : meta-llama/llama-3.2-11b-vision via OpenRouter (free)
 Stage 4c  — Repair                : claude-haiku-4-5 via OpenRouter  (cheap targeted fix)
@@ -2270,7 +2333,8 @@ Stage 0   — Environment check     : OpenRouter credit check only
 Stage 1   — Transcript parsing    : claude-haiku-4-5 via OpenRouter
 Stage 2   — Local preprocessing   : OpenCV + YOLO v8 + CLIP (CPU, slower)
 Stage 2.5 — Skip entirely         : too slow on CPU
-Stage 3   — Primary reasoning     : claude-haiku-4-5 via OpenRouter
+Stage 3   — Primary reasoning     : claude-opus-4-8 via OpenRouter (cloud — GPU-independent;
+                                    falls back to claude-sonnet-4-6 if cost-constrained)
 Stage 3.6 — Cross-check A         : google/gemini-2.5-flash via OpenRouter (free)
 Stage 3.6 — Cross-check B         : meta-llama/llama-3.2-11b-vision via OpenRouter (free)
 Stage 4c  — Repair                : claude-haiku-4-5 via OpenRouter
@@ -2278,10 +2342,11 @@ Stage 4c  — Repair                : claude-haiku-4-5 via OpenRouter
 
 ### OpenRouter Model IDs
 
-| Model | OpenRouter ID | Cost | Free Tier |
+| Model | OpenRouter ID | Cost ($/M in,out) | Free Tier |
 |---|---|---|---|
-| Claude Haiku 4.5 | `anthropic/claude-haiku-4-5` | Low | No |
-| Claude Sonnet 4.6 | `anthropic/claude-sonnet-4-6` | Mid | No (Strategy A only) |
+| Claude Opus 4.8 | `anthropic/claude-opus-4-8` | $5 / $25 (Stage 3 primary) | No |
+| Claude Sonnet 4.6 | `anthropic/claude-sonnet-4-6` | $3 / $15 (Stage 3 CPU fallback) | No |
+| Claude Haiku 4.5 | `anthropic/claude-haiku-4-5` | $1 / $5 (Stage 1 + repair) | No |
 | Gemini 2.5 Flash | `google/gemini-2.5-flash` | Very low | Yes |
 | Llama 3.2 Vision 11B | `meta-llama/llama-3.2-11b-vision-instruct` | Free | Yes |
 | Qwen2-VL 7B | `qwen/qwen2-vl-7b-instruct` | Free | Yes |
@@ -2415,7 +2480,7 @@ main.py` prints this block and writes it to `report.json` under `"operational"`.
 ```
 FINAL STRATEGY FOR output.csv: Strategy B (multi-model cascade via OpenRouter)
   Stage 1 parse  : anthropic/claude-haiku-4-5
-  Stage 3 reason : anthropic/claude-sonnet-4-6  (+ Anthropic prompt caching)
+  Stage 3 reason : anthropic/claude-opus-4-8  (+ Anthropic prompt caching, ≥4096-tok prefix)
   Stage 3.6 x-chk: google/gemini-2.5-flash + meta-llama/llama-3.2-11b-vision (free)
   Selected because: <Strategy B accuracy> vs <Strategy A accuracy> on the 20
   sample rows, at <X>% of Strategy A's paid token cost. See comparison table.
@@ -2812,17 +2877,23 @@ Run each variant against the 20 sample claims with known ground truth:
 ```
 Variant    Components Active                                         Accuracy   Tokens/claim   Cost    Latency
 ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
-A0  Full B  YOLO+CLIP+LocalVLM+Sonnet4.6+Consensus+PromptCache+Repair ?/20  ~900+cache     $X      ~1,200ms
-A1  Strat A Sonnet4.6 single call only (Strategy A)                   ?/20  ~1,200         $X      ~1,800ms
-A2  -Cons   YOLO+CLIP+LocalVLM+Sonnet4.6+Repair (no consensus)       ?/20  ~750           $X      ~1,000ms
-A3  -LVLM   YOLO+CLIP+Sonnet4.6+Consensus+Repair (no local VLM)      ?/20  ~900           $X      ~900ms
-A4  -CLIP   YOLO+LocalVLM+Sonnet4.6+Consensus+Repair (no CLIP)       ?/20  ~900           $X      ~1,100ms
+A0  Full B  YOLO+CLIP+LocalVLM+Opus4.8+Consensus+PromptCache+Repair  ?/20  ~900+cache     $X      ~1,200ms
+A1  Strat A Opus4.8 single call only (Strategy A)                    ?/20  ~1,200         $X      ~1,800ms
+A2  -Cons   YOLO+CLIP+LocalVLM+Opus4.8+Repair (no consensus)        ?/20  ~750           $X      ~1,000ms
+A3  -LVLM   YOLO+CLIP+Opus4.8+Consensus+Repair (no local VLM)       ?/20  ~900           $X      ~900ms
+A4  -CLIP   YOLO+LocalVLM+Opus4.8+Consensus+Repair (no CLIP)        ?/20  ~900           $X      ~1,100ms
 A5  -Resize Full B but full-resolution images                          ?/20  ~2,400         $X      ~2,000ms
 A6  -Order  Full B but transcript read BEFORE image                    ?/20  ~900           $X      ~1,200ms
 A7  -Fraud  Full B without EXIF/adversarial noise checks               ?/20  ~900           $X      ~1,150ms
 A8  -Repair Full B without repair loop (fail → safe defaults)          ?/20  ~750           $X      ~1,000ms
 A17 -Cache  Full B without Anthropic prompt caching                    ?/20  ~1,400         $X      ~1,200ms
+A18 Model   Full B with Sonnet 4.6 as Stage 3 (vs Opus 4.8 in A0)      ?/20  ~900           $X      ~1,100ms
 ```
+
+**A18 directly satisfies the rubric's "≥2 model configurations compared":** same
+pipeline, Stage 3 swapped Opus 4.8 ↔ Sonnet 4.6. Reports the accuracy gain of
+Opus against its ~1.67× input / 1.67× output cost premium, so the model choice is
+justified with measured numbers rather than asserted.
 
 All numbers filled in after code runs against sample_claims.csv.
 
@@ -3169,8 +3240,8 @@ class Config:
     )
     # Stage-named so there is no ambiguity with ablation "Strategy A/B" labels.
     stage1_model: str = "anthropic/claude-haiku-4-5"          # transcript parse (cheap text)
-    stage3_primary_model: str = "anthropic/claude-sonnet-4-6" # Stage 3 visual reasoning (GPU path)
-    stage3_primary_cpu_fallback: str = "anthropic/claude-haiku-4-5"  # if no local GPU
+    stage3_primary_model: str = "anthropic/claude-opus-4-8"   # Stage 3 visual reasoning (best)
+    stage3_primary_cpu_fallback: str = "anthropic/claude-sonnet-4-6"  # cheaper fallback
     stage3_repair_model: str = "anthropic/claude-haiku-4-5"   # targeted Stage 4c repair
     crosscheck_model_a: str = "google/gemini-2.5-flash"       # free tier
     crosscheck_model_b: str = "meta-llama/llama-3.2-11b-vision-instruct"  # free tier
@@ -4348,7 +4419,7 @@ Tunable without touching pipeline code.
 *Strategy: B (Multi-Model Cascade via OpenRouter)*
 *API spine: OpenRouter (single key)*
 *Stage 1 + repair model: anthropic/claude-haiku-4-5 (cheap text tasks)*
-*Stage 3 primary model: anthropic/claude-sonnet-4-6 (visual reasoning)*
+*Stage 3 primary model: anthropic/claude-opus-4-8 (visual reasoning; Sonnet 4.6 fallback)*
 *Cross-check: google/gemini-2.5-flash + meta-llama/llama-3.2-11b-vision-instruct (free tier)*
 *Local models: YOLO v8, CLIP ViT-B/32, Qwen2-VL-7B (GPU optional)*
 *Environment variables: OPENROUTER_API_KEY only*

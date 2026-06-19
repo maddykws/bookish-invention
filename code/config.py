@@ -17,15 +17,24 @@ class Config:
     openrouter_app_title: str = "damage-claim-verifier"
 
     # ── Stage-named models (no ambiguity vs ablation labels) ──────────────────
-    stage1_model: str = "anthropic/claude-haiku-4-5"           # transcript parse
-    stage3_primary_model: str = "anthropic/claude-sonnet-4-6"  # visual reasoning
-    stage3_primary_cpu_fallback: str = "anthropic/claude-haiku-4-5"
-    stage3_repair_model: str = "anthropic/claude-haiku-4-5"    # targeted repair
+    # Pricing (per 1M tok, OpenRouter ≈ Anthropic): opus-4-8 $5/$25 ·
+    # sonnet-4-6 $3/$15 · haiku-4-5 $1/$5. Opus is only ~1.67x Sonnet, and is
+    # the strongest visual reasoner — used for the load-bearing verdict (Stage 3).
+    stage1_model: str = "anthropic/claude-haiku-4-5"           # transcript parse (cheap text)
+    stage3_primary_model: str = "anthropic/claude-opus-4-8"    # visual reasoning (best)
+    stage3_primary_cpu_fallback: str = "anthropic/claude-sonnet-4-6"  # cheaper fallback
+    stage3_repair_model: str = "anthropic/claude-haiku-4-5"    # targeted repair (cheap)
     crosscheck_model_a: str = "google/gemini-2.5-flash"        # free tier
     crosscheck_model_b: str = "meta-llama/llama-3.2-11b-vision-instruct"  # free tier
 
-    # ── Strategy A model (for evaluation comparison) ──────────────────────────
-    strategy_a_model: str = "anthropic/claude-sonnet-4-6"
+    # ── Strategy A model (single-call baseline for evaluation comparison) ─────
+    strategy_a_model: str = "anthropic/claude-opus-4-8"
+
+    # ── Prompt caching ────────────────────────────────────────────────────────
+    # Minimum cacheable prefix is model-dependent: opus-4-8 = 4096 tokens,
+    # sonnet-4-6 = 2048. A shorter prefix SILENTLY won't cache (no error,
+    # cache_creation_input_tokens=0). The Stage-3 cached block must clear this.
+    prompt_cache_min_prefix_tokens: int = 4096
 
     # ── Image preprocessing ───────────────────────────────────────────────────
     resize_max_px: int = 768
