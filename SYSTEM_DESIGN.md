@@ -1357,24 +1357,157 @@ The image often contains contextual cues that can corroborate or contradict the 
 | CX6 | Image shows clean, dealership-condition car; user claims long-standing neglect damage | Clean context inconsistent with claim | API flags inconsistency; `manual_review_required` |
 | CX7 | Image timestamp burned into photo differs from EXIF timestamp | Both checked; discrepancy flagged | `non_original_image` + `manual_review_required` |
 
-### 9.20 Privacy-Sensitive Content in Images
+### 9.20 Privacy-Sensitive Content in Images (Input Side)
 
-These scenarios do not change the verdict logic but must not cause pipeline failure or leakage.
+These scenarios do not change the verdict logic but must not cause pipeline failure or data leakage.
+The verdict evaluates physical damage only. PII visible in images is irrelevant to the verdict and must not be extracted, logged, or referenced.
 
 | ID | Scenario | Handler |
 |---|---|---|
-| PV1 | Car image includes clearly visible license plate | Verdict unaffected; do not extract or log license plate text |
-| PV2 | Laptop image shows personal documents on screen | Verdict unaffected; prompt instructs model to evaluate damage only |
-| PV3 | Car image includes person's face | Verdict unaffected; do not flag face as evidence |
-| PV4 | Package image shows full recipient name and home address on label | Verdict unaffected; do not extract or log PII from label |
-| PV5 | Image shows financial/medical documents as background | Verdict unaffected; model instructed to evaluate physical damage only |
+| PV1 | Car image includes clearly visible license plate | Verdict unaffected; prompt: do not extract or reference plate text |
+| PV2 | Laptop image shows personal documents on screen | Verdict unaffected; evaluate physical damage to device only |
+| PV3 | Car image includes a person's face | Verdict unaffected; do not flag face or describe the person |
+| PV4 | Package image shows full recipient name and home address on label | Verdict unaffected; do not extract or log name/address |
+| PV5 | Image shows financial or medical documents in background | Verdict unaffected; do not transcribe document content |
+| PV6 | Car image shows registration document visible through windshield | Do not extract registration number; evaluate exterior damage only |
+| PV7 | Home interior visible in package photo (security cameras, layout) | Do not describe home layout; evaluate package damage only |
+| PV8 | Laptop screen shows active chat or email | Do not read or reference message content; evaluate screen damage |
+| PV9 | Image shows child in background | Do not reference the child; evaluate damage only |
+| PV10 | Phone screenshot shows notification banners with names/messages | Do not extract notification content; evaluate phone/screen damage |
+| PV11 | Image contains partial credit card or bank account number on receipt | Do not transcribe any numeric sequences from documents |
+| PV12 | Car interior shows ID card or passport | Do not reference identity document; evaluate interior damage only |
+| PV13 | EXIF contains GPS coordinates (location of photo) | Stage 2 reads GPS for intelligence (see 9.22); never logs to output.csv |
 
-**Privacy rule in Stage 3 prompt:**
+**Privacy rule embedded in every Stage 3 prompt:**
 ```
-"Evaluate this image ONLY for physical damage evidence.
- Do not extract, transcribe, or reference any personal information,
- license plates, faces, addresses, or document text visible in the image."
+"Evaluate this image ONLY for physical damage evidence relevant to the claim.
+ Do NOT extract, transcribe, reference, or repeat any of the following:
+   - License plate numbers or vehicle registration text
+   - Names, addresses, or contact information
+   - Financial document content, card numbers, or account details
+   - Medical document content
+   - Message, email, or notification content
+   - Identity document numbers or photos
+   - Home or building layout details
+   - Faces or descriptions of people
+ If you see any of the above, ignore it entirely.
+ Your only task is to assess physical damage to the claimed object."
 ```
+
+### 9.21 Output Privacy Leakage Prevention
+
+**This is a distinct risk from input privacy.** Even if the Stage 3 prompt instructs the model not to reference PII, a vision LLM can still extract and repeat PII in the `claim_status_justification` or `claim_text` output fields — which then flows into `output.csv` and downstream systems.
+
+A post-processing PII scrubber runs on all free-text output fields before writing to `output.csv`.
+
+| ID | Leakage Scenario | What Model Might Output | Scrubber Action |
+|---|---|---|---|
+| OPV1 | License plate visible in car image | `justification: "Vehicle ABC-1234 shows dent on rear bumper"` | Redact plate: `"Vehicle [PLATE REDACTED] shows dent..."` |
+| OPV2 | Package label with name/address | `claim_text: "Package for John Smith at 123 Main St..."` | Redact name + address |
+| OPV3 | Financial doc in background | `justification: "Account ending 4821 visible; damage to screen..."` | Redact numeric sequence |
+| OPV4 | GPS inferred from visible landmarks | `justification: "Image appears to be taken at [specific address]"` | Flag + redact inferred location |
+| OPV5 | Person described in image | `justification: "A man in a blue shirt is holding the laptop..."` | Remove person description |
+| OPV6 | Notification banner content | `justification: "Screen shows crack; message from 'Sarah' visible"` | Redact name from notification reference |
+
+**Scrubber implementation:**
+
+```python
+import re
+
+PII_PATTERNS = [
+    (r'\b[A-Z]{2,3}[-\s]?\d{3,4}\b',          "[PLATE REDACTED]"),   # license plates
+    (r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b', "[CARD REDACTED]"),  # card numbers
+    (r'\b\d{1,5}\s\w+\s(Street|St|Avenue|Ave|Road|Rd|Lane|Ln|Drive|Dr)\b',
+                                                "[ADDRESS REDACTED]"),
+]
+
+def scrub_pii(text: str) -> tuple[str, bool]:
+    """Returns (scrubbed_text, pii_was_found)."""
+    scrubbed = text
+    found = False
+    for pattern, replacement in PII_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            scrubbed = re.sub(pattern, replacement, scrubbed, flags=re.IGNORECASE)
+            found = True
+    return scrubbed, found
+```
+
+Applied to: `claim_text`, `claim_status_justification`, `evidence_standard_met_reason`.
+Never applied to: `user_id`, `image_paths` (structural fields, not model-generated).
+PII detection events are logged (but the PII itself is not logged).
+
+### 9.22 EXIF / Geolocation Intelligence
+
+EXIF metadata is a rich signal beyond just date. GPS coordinates, device identifiers, and software tags add fraud detection layers that pixel analysis alone cannot provide.
+
+| ID | Scenario | Stage 2 Check | Output |
+|---|---|---|---|
+| GX1 | GPS coordinates in EXIF — location matches claimed incident location | Cross-reference with claim narrative (city-level only) | Corroborating signal; no flag |
+| GX2 | GPS shows repair shop address — incident already handled before claim | API reasoning + GPS → `manual_review_required` | `non_original_image` candidate |
+| GX3 | GPS shows highway location; user claims "parked car was damaged overnight" | Location inconsistency | `manual_review_required` |
+| GX4 | GPS places photo in a different country than user's registered address | Geographic inconsistency | `manual_review_required` + `user_history_risk` |
+| GX5 | Multiple images from same claim taken in different GPS locations (> 50km apart) | Images cannot be of the same incident | `claim_mismatch`; `manual_review_required` |
+| GX6 | GPS data is all zeros (0.0, 0.0) | Possible deliberate GPS removal | Treat as absent — no flag, no inference |
+| GX7 | GPS data absent entirely (common for screenshotted images) | Missing GPS → one signal toward `non_original_image` | Combined with other signals |
+| GX8 | EXIF Software tag shows image editing app (Adobe Photoshop, GIMP, Snapseed) | Edited image | `non_original_image` candidate; `manual_review_required` |
+| GX9 | EXIF Make/Model field is blank or says "unknown" | Possible metadata stripped deliberately | Combined with other signals |
+| GX10 | EXIF timestamp is 3:47am for a claim about daytime parking lot damage | Time inconsistency | Note in justification; `manual_review_required` |
+
+**GPS is never written to output.csv** — it is a pipeline intelligence signal only.
+City-level location comparison only — never log or output precise coordinates.
+
+### 9.23 Image Chain of Custody
+
+These scenarios detect whether an image has passed through multiple hands before submission — a strong fraud signal.
+
+| ID | Scenario | Detection | Handler |
+|---|---|---|---|
+| CC1 | JPEG saved 5+ times (generational compression loss) | Pixel block artifact analysis (JPEG ghost detection) | `non_original_image` candidate |
+| CC2 | Image has watermark from an insurance or repair app | API visual reasoning detects logo/watermark | `non_original_image`; image may have been submitted elsewhere first |
+| CC3 | Image has "VOID", "SAMPLE", or "COPY" overlay text | Visible text detection | `text_instruction_present`; `valid_image=false` |
+| CC4 | Image downloaded from web — HTTP-origin EXIF tags present | EXIF UserComment or ImageDescription contains URLs | `non_original_image` + `manual_review_required` |
+| CC5 | Image contains visible UI of another app (phone gallery "DELETE" button visible) | API detects UI chrome in image | `non_original_image` — user screenshotted their gallery |
+| CC6 | Image shows repair receipt or estimate alongside the damage | Damage pre-assessed externally before claim | `manual_review_required` — claim may be post-repair |
+| CC7 | Image contains another device screen showing the same damage | Screen-within-screen with matching damage | SHA-256 won't catch this; API reasoning flags it |
+| CC8 | Watermark from stock photo site (Getty, Shutterstock, Unsplash) visible | API detects watermark text | `non_original_image`; `claim_status=contradicted` |
+
+### 9.24 Claim Language and Authorship Signals
+
+The way a claim is written can signal authenticity or fraud — even before any image is seen.
+These are extracted during Stage 1 and injected as context into Stage 3.
+
+| ID | Scenario | Signal | Stage 3 Context |
+|---|---|---|---|
+| LA1 | Highly technical automotive terminology — user sounds like a mechanic | Expertise signal: could be legitimate or coached | Flag: note unusual technical precision |
+| LA2 | Legal/insurance jargon used correctly ("diminished value", "total loss threshold") | User may be coached by a claims farmer | `manual_review_required` |
+| LA3 | Insurance jargon used INCORRECTLY | User misusing terminology they don't understand | Note inconsistency; proceed normally |
+| LA4 | Claim written in formal third-person voice ("The claimant alleges...") | Written by third party (lawyer, fraud service) | `manual_review_required` |
+| LA5 | Claim copy-pasted from internet forum template (generic, no personal details) | Low authenticity signal | `claim_mismatch` candidate |
+| LA6 | Claim describes CAUSE in extreme detail but not the damage itself | Narrative anchoring attempt — user tells story, avoids specifics about visible damage | Stage 3: image-first order neutralises this |
+| LA7 | Claim only states desired outcome ("I want a full replacement") with no damage description | No verifiable claim to assess | `issue_type=unknown`; NEI |
+| LA8 | Claim is written entirely in passive voice ("damage was observed", "it appears") | Distancing language — common in coached claims | Note in justification; `manual_review_required` |
+| LA9 | Transcript shows agent pushing user toward specific damage descriptions | Agent-coached claim | `manual_review_required` |
+| LA10 | User explicitly says "my previous claim was rejected but this is different" | Self-referential claim history | Retrieve user history; `user_history_risk` if pattern matches |
+
+**Language signals are context, not verdict.**
+They raise flags and inform the human reviewer. They never independently determine `claim_status`.
+
+### 9.25 Batch Processing Order and Concurrency
+
+These test the pipeline at the batch level — not individual claim correctness.
+
+| ID | Scenario | Handler |
+|---|---|---|
+| BP1 | Claims 1 and 200 are the same fraud — cannot know at Claim 1 processing time | Claim 1: normal result. Claim 200: cross-claim SHA-256 hit → `user_history_risk` added retroactively? No — each claim is final when written. Log cross-claim detection for human audit. |
+| BP2 | Pipeline crashes at Claim 100 — resume from 101 | Checkpoint read at startup; Claim 100 not in output.csv → processed fresh; Claim 100 gets safe defaults if it keeps failing |
+| BP3 | Two identical claims submitted simultaneously (race condition on L1 cache write) | `asyncio.Lock` on cache write; second claim waits for first to complete, then gets L1 cache hit |
+| BP4 | Checkpoint file is corrupted or empty | Treat as no checkpoint — reprocess all claims; L2 disk cache prevents redundant API calls |
+| BP5 | Output.csv header row missing (empty file, crash on first write) | Write header on first row creation; `exist_ok` logic on file open |
+| BP6 | Disk full during output write at Claim 150 | Catch `OSError`; halt gracefully; log which claim failed; do not write partial row |
+| BP7 | Memory pressure — 200 images all loaded into RAM simultaneously | Async image loading per-claim; release after processing; never hold all images in memory |
+| BP8 | One claim takes 45 seconds (slow model response) — does it block others? | Async pipeline; `asyncio.gather` with per-claim timeout; slow claim does not block batch |
+| BP9 | Cross-claim ChromaDB query race: Claim A querying while Claim B is inserting | ChromaDB client is thread-safe; async calls serialised per collection; no race |
+| BP10 | All 200 claims have the same user_id (stress test user history lookup cache) | `dict[str, UserHistory]` loaded at startup; O(1) lookup; no repeated file reads |
 
 ---
 
