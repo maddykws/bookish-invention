@@ -222,7 +222,7 @@ Four input sources feed every claim. Each has its own loading, parsing, and fail
 
 ### 4.1 Input 1 — Claim Conversations (transcript)
 
-**Source:** `claim_transcript` column in claims.csv
+**Source:** `user_claim` column in claims.csv
 
 **Format seen in data:**
 ```
@@ -536,7 +536,7 @@ class ClaimRow(BaseModel):
     """Raw row from claims.csv"""
     user_id: str
     image_paths: str            # semicolon-separated paths
-    claim_transcript: str
+    user_claim: str             # actual column name in sample_claims.csv
     claim_object: Literal["car", "laptop", "package"]
 
     @property
@@ -868,7 +868,7 @@ No `ANTHROPIC_API_KEY`. No `GOOGLE_API_KEY`. OpenRouter proxies everything.
 │  4b. CONSISTENCY CHECK (local, 0 tokens)                        │
 │      → justification contradicts verdict?                      │
 │      → severity=high but issue_type=none?                      │
-│      → evidence_met=true but valid_image=false for all?        │
+│      → evidence_met=true but valid_image=false?        │
 │      → supporting_ids populated when claim_status=contradicted?│
 │                                                                 │
 │  4c. REPAIR LOOP                                                │
@@ -1237,7 +1237,7 @@ These cases stress-test whether the model correctly places damage on the scale.
 | SV4 | Multiple damage types in same image (dent + scratch) | `issue_type` = dominant type; `severity` = highest visible |
 | SV5 | Cosmetic vs functional: scratch on laptop lid | `severity=low`; functional damage not visible → NEI for function claim |
 | SV6 | Borderline low/medium: dent visible but shallow | System must not flip between runs — determinism check |
-| SV7 | Package corner crushed, contents visible intact | `issue_type=torn_packaging`, `severity=medium`; contents claim → NEI |
+| SV7 | Package corner crushed, contents visible intact | `issue_type=crushed_packaging`, `severity=medium`; contents claim → NEI |
 | SV8 | `claim_status=not_enough_information` | `severity` must be `unknown` — consistency rule enforced |
 | SV9 | `claim_status=contradicted` + no damage visible | `severity=none`, `issue_type=none` |
 | SV10 | Severe damage across multiple object parts | `object_part` = primary claimed part; `severity=high` if that part affected |
@@ -1318,12 +1318,12 @@ Each case produces an output that must be caught and fixed before writing to out
 | ID | Scenario | Violation | Handler |
 |---|---|---|---|
 | SC1 | Model outputs `issue_type="glass_shatter"` for a package claim | Wrong object-type mapping for issue_type | Repair: "glass_shatter is not valid for package; valid: torn_packaging, water_damage, stain, missing_part" |
-| SC2 | Model outputs `supporting_image_ids` referencing a blurry (invalid) image | Invalid image cannot be a supporting image | Repair: "supporting_image_ids must only reference valid_image=true images" |
+| SC2 | Model outputs `supporting_image_ids` referencing a blurry (invalid) image | Invalid image cannot be a supporting image | Repair: "supporting_image_ids must only reference images that passed pre-filters" |
 | SC3 | Model outputs `object_part="unknown"` when part IS clearly visible | Inconsistency with visual evidence | Repair loop targets this field specifically |
 | SC4 | `severity="high"` + `issue_type="none"` | Impossible combination | Caught by Stage 4b rule 1 |
 | SC5 | `evidence_standard_met=false` + `claim_status="supported"` | Impossible combination | Caught by Stage 4b rule 6 |
 | SC6 | `risk_flags` contains duplicate flags (`"blurry_image;blurry_image"`) | Redundant, may confuse downstream | Repair: deduplicate flags |
-| SC7 | `valid_image` count ≠ image count (2 images, only 1 boolean in field) | Schema mismatch | Repair: "valid_image must have exactly N values for N submitted images" |
+| SC7 | `valid_image=true` but all images failed pre-filter (blank/corrupt/missing) | Impossible combination | Force `valid_image=false`; re-run Stage 3 consistency check |
 | SC8 | `claim_status="contradicted"` + `supporting_image_ids` populated | Contradicted claims have no supporting images | Caught by Stage 4b rule 5 |
 | SC9 | `claim_status="not_enough_information"` + `severity="high"` | NEI = unknown severity | Caught by Stage 4b; severity forced to `unknown` |
 | SC10 | All 14 fields present but `claim_status_justification` is one word ("unclear") | Insufficient justification | Repair: "justification must reference specific visual evidence" |
@@ -1671,12 +1671,12 @@ From `evidence_requirements.csv` — loaded at startup, checked locally in Stage
 | `evidence_standard_met` | boolean | true, false |
 | `evidence_standard_met_reason` | string | Free text explanation |
 | `risk_flags` | string | Semicolon-separated list |
-| `issue_type` | string | dent, scratch, crack, glass_shatter, broken_part, missing_part, torn_packaging, water_damage, stain, none, unknown |
+| `issue_type` | string | dent, scratch, crack, glass_shatter, broken_part, missing_part, torn_packaging, crushed_packaging, water_damage, stain, none, unknown |
 | `object_part` | string | Specific part name |
 | `claim_status` | string | supported, contradicted, not_enough_information |
 | `claim_status_justification` | string | Evidence-grounded explanation |
 | `supporting_image_ids` | string | Semicolon-separated image IDs or "none" |
-| `valid_image` | string | true, false (semicolon-separated per image) |
+| `valid_image` | boolean | Single bool: overall image set usable for evaluation |
 | `severity` | string | none, low, medium, high, unknown |
 
 ### Schema Consistency Rules (enforced locally in Stage 4)
@@ -1684,7 +1684,7 @@ From `evidence_requirements.csv` — loaded at startup, checked locally in Stage
 ```
 severity=high         → issue_type must not be "none"
 severity=none         → issue_type should be "none" or "unknown"
-valid_image=false (all images) → evidence_standard_met must be false
+valid_image=false → evidence_standard_met must be false
 evidence_met=true     → at least one supporting_image_id must exist
 claim_status=not_enough_information → supporting_image_ids should be "none"
 supporting_image_ids  → must only reference IDs from submitted images for this claim
@@ -2358,14 +2358,14 @@ class ClaimOutput(BaseModel):
     risk_flags: str                    # semicolon-separated
     issue_type: Literal[
         "dent", "scratch", "crack", "glass_shatter", "broken_part",
-        "missing_part", "torn_packaging", "water_damage", "stain",
-        "none", "unknown"
+        "missing_part", "torn_packaging", "crushed_packaging",
+        "water_damage", "stain", "none", "unknown"
     ]
     object_part: str
     claim_status: Literal["supported", "contradicted", "not_enough_information"]
     claim_status_justification: str
     supporting_image_ids: str          # semicolon-separated or "none"
-    valid_image: str                   # semicolon-separated true/false per image
+    valid_image: bool                  # single boolean: overall image set usable
     severity: Literal["none", "low", "medium", "high", "unknown"]
 
     @field_validator("risk_flags")
@@ -2724,8 +2724,8 @@ class ClaimRowValidator:
         if not row.get("user_id") or str(row["user_id"]).strip() == "":
             errors.append("user_id is null or empty")
 
-        if not row.get("claim_transcript") or len(str(row["claim_transcript"]).strip()) < 2:
-            errors.append("claim_transcript is empty or too short")
+        if not row.get("user_claim") or len(str(row["user_claim"]).strip()) < 2:
+            errors.append("user_claim is empty or too short")
 
         obj = str(row.get("claim_object", "")).strip().lower()
         if obj not in ClaimRowValidator.VALID_OBJECTS:
