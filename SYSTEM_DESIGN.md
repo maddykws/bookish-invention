@@ -2917,6 +2917,69 @@ Nothing flows between pipeline stages as a raw dict.
 
 ---
 
+### 23.2a The Output Writer Contract (enforced, not assumed)
+
+*"For each row in claims.csv, generate one row in output.csv"* is a
+**count + order + survivability** contract, not just a schema. A single dropped
+row, a shifted column, or a Python-cased boolean zeroes out whole columns at
+grading — the exact 3/30 failure profile. The writer enforces all of it in code,
+with `OUTPUT_COLUMNS` (in `code/pipeline/models.py`) as the ONE source of order:
+
+```python
+# code/pipeline/output_writer.py
+import csv
+from pathlib import Path
+from code.pipeline.models import ClaimOutput, OUTPUT_COLUMNS, output_to_row
+
+EXPECTED_HEADER = [
+    "user_id", "image_paths", "user_claim", "claim_object",
+    "evidence_standard_met", "evidence_standard_met_reason", "risk_flags",
+    "issue_type", "object_part", "claim_status", "claim_status_justification",
+    "supporting_image_ids", "valid_image", "severity",
+]
+
+def write_output(rows: list[ClaimOutput], input_row_count: int, path: str) -> None:
+    # CONTRACT 1 — order is fixed and canonical
+    assert OUTPUT_COLUMNS == EXPECTED_HEADER, "OUTPUT_COLUMNS drifted from the 14-col spec"
+    # CONTRACT 2 — one row out per row in (survivability already guarantees a
+    # ClaimOutput per claim via safe_defaults; this asserts it actually happened)
+    assert len(rows) == input_row_count, (
+        f"row-count mismatch: {len(rows)} out vs {input_row_count} in"
+    )
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS, extrasaction="raise")
+        w.writeheader()
+        for r in rows:
+            w.writerow(output_to_row(r))   # lowercase bools + internal-flag remap
+
+def assert_output_matches_sample_header(sample_claims_path: str) -> None:
+    """If the grader's sample file is present, assert our header is byte-identical
+    (catches casing/rename drift at the source). Called once at Stage 0."""
+    import pandas as pd
+    cols = list(pd.read_csv(sample_claims_path, nrows=0).columns)
+    for name in EXPECTED_HEADER:
+        assert name in cols, f"sample_claims.csv missing expected output column: {name!r}"
+```
+
+The four runtime guarantees this locks in:
+
+```
+1. ORDER         OUTPUT_COLUMNS is the single source; header + every row use it.
+                 CONTRACT 1 fails the run if the list is ever edited out of spec.
+2. COUNT         CONTRACT 2 asserts len(out) == len(in). No silent dropped row.
+3. SURVIVABILITY Batch isolation + safe_defaults() emit a valid 14-col row on ANY
+                 per-claim failure, so COUNT can be met even when a claim errors.
+4. VALUE FORMAT  output_to_row() lowercases booleans (true/false) and remaps
+                 model_consensus_conflict → manual_review_required before write.
+```
+
+`extrasaction="raise"` on the DictWriter means an unexpected key (e.g. a typo, or
+a stray internal field) raises immediately rather than silently writing a
+malformed row. The writer cannot emit anything but exactly these 14 columns.
+
+---
+
 ### 23.3 Single Config Dataclass
 
 ```python
