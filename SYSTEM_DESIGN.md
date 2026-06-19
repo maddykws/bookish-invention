@@ -530,6 +530,58 @@ If Stage 1 cannot extract issue_family:
 
 ---
 
+### 4.4b ChromaDB — Agent Memory (Dual Role)
+
+The hackathon's requirements.txt explicitly includes ChromaDB under
+`# Agent memory`. We use it in two distinct roles that together match
+that label:
+
+**Role 1 — Cross-claim fraud detection (batch-level fraud memory)**
+```
+After each claim is processed, embed the claim text using
+sentence-transformers all-MiniLM-L6-v2 and upsert into a ChromaDB
+collection ("claim_memory") keyed by user_id + claim_hash.
+
+When processing a new claim, query the collection for semantically
+similar past claims (cosine similarity > 0.88) from OTHER users.
+If a near-match exists:
+  → risk_flags += claim_mismatch
+  → risk_flags += user_history_risk (coordinated fraud signal)
+  → Justification notes: "Semantically similar claim detected from
+    a different user earlier in this batch."
+
+This catches FR9 (semantic near-duplicate with watermark removed) and
+AI5 (fraud ring submitting prompt-engineered damage with unique images
+that bypass SHA-256 but share nearly identical transcripts).
+```
+
+**Role 2 — Per-claim contextual enrichment (session memory)**
+```
+When processing a claim, retrieve the top-3 most similar CONFIRMED
+claims from earlier in the batch (those already resolved as supported
+or contradicted with high confidence) and include a brief summary in
+Stage 3 context:
+
+  "SIMILAR CASES SEEN THIS SESSION:
+   - user_003 (car/dent/supported): rear bumper dent, medium severity,
+     single image sufficient, clear damage visible.
+   - user_007 (car/broken_part/supported): similar angle, high confidence.
+  Use these only as calibration context. They do not determine this verdict."
+
+This improves severity calibration consistency across the batch — the model
+has seen what "medium severity" looked like earlier — and prevents
+inconsistent severity scoring for borderline cases.
+Only retrieve claims with claim_status ≠ not_enough_information and
+confidence ≥ 0.80 as references. Never retrieve claims that triggered
+user_history_risk (don't let fraud patterns influence later verdicts).
+```
+
+**Why ChromaDB instead of a simple dict:**
+A dict would require exact text match. ChromaDB uses vector similarity,
+catching reworded identical claims and partially-modified transcripts.
+The built-in ONNX embedder in ChromaDB (no torch required) handles Role 1;
+sentence-transformers (optional, GPU) handles Role 2 for higher quality.
+
 ### 4.5 How All Four Inputs Converge in Stage 3
 
 The single API call in Stage 3 receives all four inputs assembled as:
@@ -618,7 +670,7 @@ class ClaimRow(BaseModel):
 
 | Dimension | Strategy A (Baseline) | Strategy B (Cascade) |
 |---|---|---|
-| Architecture | Single Claude Sonnet call via OpenRouter | YOLO → CLIP → Local VLM → Haiku → Consensus |
+| Architecture | Single Claude Sonnet 4.6 call via OpenRouter | YOLO → CLIP → Local VLM → Sonnet 4.6 → Consensus |
 | API routing | OpenRouter | OpenRouter |
 | Cost per claim | ~1,200 tokens | ~750 tokens (API portion) |
 | Local compute | None | GPU/CPU preprocessing |
@@ -668,11 +720,11 @@ Claude Haiku, Gemini 2.5 Flash, Llama 3.2 Vision — all called through this sam
 OpenRouter tries models in order. If the first is rate-limited or fails, it silently moves to the next. The batch never stalls.
 
 ```
-Stage 1  (transcript)   → claude-haiku-4-5  │ gemini-2.5-flash
-Stage 3  (reasoning)    → claude-haiku-4-5  │ gemini-2.5-flash  │ llama-3.2-11b-vision
-Stage 3.6 cross-check A → gemini-2.5-flash  │ qwen2-vl-7b        (free tier)
-Stage 3.6 cross-check B → llama-3.2-11b    │ qwen2-vl-7b        (free tier)
-Stage 4c (repair)       → claude-haiku-4-5  │ gemini-2.5-flash
+Stage 1  (transcript)   → claude-haiku-4-5   │ gemini-2.5-flash
+Stage 3  (reasoning)    → claude-sonnet-4-6  │ claude-haiku-4-5  │ gemini-2.5-flash
+Stage 3.6 cross-check A → gemini-2.5-flash   │ qwen2-vl-7b        (free tier)
+Stage 3.6 cross-check B → llama-3.2-11b-vision│ qwen2-vl-7b       (free tier)
+Stage 4c (repair)       → claude-haiku-4-5   │ gemini-2.5-flash
 ```
 
 ### 4.4 Token + Cost + Latency — From OpenRouter, Not Our Code
@@ -1038,15 +1090,49 @@ On startup:
 
 | Stage | Model (via OpenRouter) | Est. Tokens | Free? |
 |---|---|---|---|
-| Stage 1 transcript parse | Haiku (primary) | ~150 | No |
+| Stage 1 transcript parse | Haiku 4.5 | ~150 | No |
 | Stage 2 local preprocessing | None | 0 | Yes |
 | Stage 2.5 local VLM | Local (GPU only) | 0 | Yes |
-| Stage 3 API reasoning | Haiku (primary) | ~600-900 | No |
+| Stage 3 API reasoning | Sonnet 4.6 | ~600-900 | No |
 | Stage 3.6 cross-check A | Gemini 2.5 Flash | ~500 | Yes (free tier) |
 | Stage 3.6 cross-check B | Llama 3.2 Vision | ~500 | Yes (free tier) |
-| Stage 4c repair (if needed) | Haiku (primary) | ~300 | No |
+| Stage 4c repair (if needed) | Haiku 4.5 | ~300 | No |
 | **Total paid per clean claim** | | **~750-1,050** | |
 | **Total paid per uncertain claim** | | **~750-1,050** | Same — cross-check is free |
+
+### 7.1b Anthropic Prompt Caching — Stage 3 Cost Multiplier
+
+The Stage 3 system prompt is **identical for every claim**: it contains the
+evidence requirements table, the verdict framework, the output schema, and the
+privacy/injection defense headers. This is ~400–600 tokens that never changes
+across 200 claims. Anthropic's [prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching)
+prices cached input tokens at **10% of the normal rate** after the first call.
+
+```
+Without prompt caching — Sonnet 4.6 pricing (~$3/M input):
+  200 claims × 500 static tokens = 100,000 tokens × $3.00/M = $0.30
+
+With prompt caching — 10% rate after cache write:
+  1 cache write × 500 tokens    = 500 tokens  × $3.75/M    = $0.002  (1.25× write cost)
+  199 cache hits × 500 tokens   = 99,500 tokens × $0.30/M  = $0.030  (90% discount)
+  Net static system-prompt cost = ~$0.032 vs $0.30 = 89% savings on static tokens
+
+Per-claim savings: ~$0.0013 × 199 cache hits = $0.26 saved on 200 claims
+As a fraction of total Stage 3 cost: significant when system prompt is large.
+```
+
+**Implementation:** Pass `cache_control={"type": "ephemeral"}` on the system
+message (or on the last assistant turn if using multi-turn). OpenRouter supports
+this header and passes it to Anthropic. Track `cache_discount` in the
+OpenRouter generation API response to confirm caching fired.
+
+Note: Prompt caching requires the cached block to be ≥1,024 tokens. If the
+system prompt is shorter, concatenate evidence_requirements.csv content into
+it to cross the threshold.
+
+**This is ablation A17 (cache ON vs OFF)** — run both and include the exact
+cost comparison in the evaluation report. The problem statement explicitly
+asks about caching strategy; this is the answer.
 
 ### 7.2 Batch Cost Estimate
 
@@ -1259,6 +1345,9 @@ The model cannot anchor on the claim before forming a visual opinion.
 | ST5 | `claim_object` in CSV ≠ object in transcript | Flag `claim_mismatch`, use transcript |
 | ST6 | User ID not in user_history.csv | No history flags, treat as new user |
 | ST7 | Image path is a folder, not a file | Skip that path; if no other image passes, `valid_image=false` for the overall set; if another image is usable, `valid_image=true` |
+| ST8 | **Completely unrelated image** — image of an empty room, sky, food; YOLO detects no car/laptop/package at all | `wrong_object` flag, `claim_status=not_enough_information`, `object_part=unknown`, `issue_type=unknown`, `valid_image=false`. Distinct from wrong_angle (NI1) — there is no claimed object anywhere in frame |
+| ST9 | **Intact package exterior, damaged contents visible** — box seal intact, but opened top reveals crushed item inside. User claimed "package damage" | Package exterior claim → `claim_status=not_enough_information` (no exterior damage visible); `damage_not_visible` on the package itself. Do NOT assess contents damage (user did not claim contents); `object_part=seal` or similar. If user had claimed contents — out of scope for package evidence standard (user_032 pattern) |
+| ST10 | **Sub-pixel / micro damage** — scratch or chip at 768px resolution is ≤5px wide, barely discernible | `severity=low` if damage is distinguishable at all (never `none` if any damage is visible); `evidence_standard_met=false` if the image quality is insufficient to confirm at this resolution; do NOT force `none` — if you can see it, it is `low` |
 
 ### 9.10 Consensus / Multi-Model Scenarios (New)
 
@@ -2404,17 +2493,18 @@ Each ablation answers a specific question the judge might ask:
 Run each variant against the 20 sample claims with known ground truth:
 
 ```
-Variant    Components Active                                  Accuracy   Tokens/claim   Cost    Latency
-────────────────────────────────────────────────────────────────────────────────────────────────────────
-A0  Full B  YOLO+CLIP+LocalVLM+Haiku+Consensus+Repair        ?/20       ~900           $X      ~1,200ms
-A1  Strat A Sonnet single call only                          ?/20       ~1,200         $X      ~1,800ms
-A2  -Cons   YOLO+CLIP+LocalVLM+Haiku+Repair (no consensus)  ?/20       ~750           $X      ~1,000ms
-A3  -LVLM   YOLO+CLIP+Haiku+Consensus+Repair (no local VLM) ?/20       ~900           $X      ~900ms
-A4  -CLIP   YOLO+LocalVLM+Haiku+Consensus+Repair (no CLIP)  ?/20       ~900           $X      ~1,100ms
-A5  -Resize Full B but full-resolution images                ?/20       ~2,400         $X      ~2,000ms
-A6  -Order  Full B but transcript read BEFORE image          ?/20       ~900           $X      ~1,200ms
-A7  -Fraud  Full B without EXIF/adversarial noise checks     ?/20       ~900           $X      ~1,150ms
-A8  -Repair Full B without repair loop (fail → safe defaults)?/20       ~750           $X      ~1,000ms
+Variant    Components Active                                         Accuracy   Tokens/claim   Cost    Latency
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────
+A0  Full B  YOLO+CLIP+LocalVLM+Sonnet4.6+Consensus+PromptCache+Repair ?/20  ~900+cache     $X      ~1,200ms
+A1  Strat A Sonnet4.6 single call only (Strategy A)                   ?/20  ~1,200         $X      ~1,800ms
+A2  -Cons   YOLO+CLIP+LocalVLM+Sonnet4.6+Repair (no consensus)       ?/20  ~750           $X      ~1,000ms
+A3  -LVLM   YOLO+CLIP+Sonnet4.6+Consensus+Repair (no local VLM)      ?/20  ~900           $X      ~900ms
+A4  -CLIP   YOLO+LocalVLM+Sonnet4.6+Consensus+Repair (no CLIP)       ?/20  ~900           $X      ~1,100ms
+A5  -Resize Full B but full-resolution images                          ?/20  ~2,400         $X      ~2,000ms
+A6  -Order  Full B but transcript read BEFORE image                    ?/20  ~900           $X      ~1,200ms
+A7  -Fraud  Full B without EXIF/adversarial noise checks               ?/20  ~900           $X      ~1,150ms
+A8  -Repair Full B without repair loop (fail → safe defaults)          ?/20  ~750           $X      ~1,000ms
+A17 -Cache  Full B without Anthropic prompt caching                    ?/20  ~1,400         $X      ~1,200ms
 ```
 
 All numbers filled in after code runs against sample_claims.csv.
@@ -2511,6 +2601,7 @@ If repair_attempts > 0 → repair loop fixed real failures
 | A14 | FFT + EXIF + semantic AI check | Add diffusion-era fraud detection on top of FFT | arXiv:2510.19957 generative AI fraud |
 | A15 | supporting_image_ids: cite-all vs cite-evidentiary-subset | Whether to list every submitted image or only the image(s) the verdict relies on | Ground-truth grading — user_003/012/030 cite a strict subset; cite-all would mismatch |
 | A16 | valid_image: derive-from-prefilter vs dedicated-judgment | Whether valid_image is set from readability pre-filters or a separate authenticity/usability judgment | Ground-truth grading — user_008 has valid_image=false on a readable image that meets the evidence standard; pre-filter derivation gets this wrong |
+| A17 | Anthropic prompt caching ON vs OFF | Whether the static Stage 3 system prompt is cached (10% cost on repeat hits) or billed full-rate each call | Problem statement asks for caching strategy; this is the concrete answer with measured cost delta |
 
 A15 and A16 are not research-driven — they are **directly graded behaviors** the
 sample answers expose. They are the cheapest high-yield ablations we have, because
@@ -3070,11 +3161,18 @@ Every row is validated before entering the pipeline. Invalid rows get safe defau
 ```python
 class ClaimRowValidator:
     VALID_OBJECTS = {"car", "laptop", "package"}
+    # Sanctioned output vocabulary — exactly 11 values + "none".
+    # model_consensus_conflict is INTERNAL ONLY: remap → manual_review_required
+    # before writing output.csv; never appear here.
     VALID_RISK_FLAGS = {
         "blurry_image", "cropped_or_obstructed", "claim_mismatch",
         "user_history_risk", "manual_review_required", "wrong_object",
         "wrong_angle", "damage_not_visible", "non_original_image",
-        "text_instruction_present", "model_consensus_conflict", "none"
+        "text_instruction_present", "none"
+    }
+    # Internal-only flags that must be remapped before output:
+    INTERNAL_FLAG_MAP = {
+        "model_consensus_conflict": "manual_review_required",
     }
 
     @staticmethod
@@ -3142,6 +3240,28 @@ If injection detected:
 - Log the original text (for audit) and proceed with sanitized version
 - Never raise an exception — the claim still gets processed
 
+**Two additional injection surfaces that must also be screened:**
+
+1. **EXIF text fields** — Stage 2 reads `ImageDescription`, `UserComment`,
+   `Artist`, `Copyright` from image EXIF metadata. These are user-controlled
+   and can contain injection text. Before passing EXIF context to Stage 3,
+   run `screen_transcript()` on each text field. EXIF injection bypasses the
+   transcript screener entirely if not separately handled.
+
+2. **`history_summary` from user_history.csv** — this free-text field
+   ("Low-risk user with prior accepted car damage claims") is injected into
+   Stage 3 context. If an attacker controls this field, they bypass the
+   screener. Run `screen_transcript()` on `history_summary` before use.
+
+**Multilingual injection gap (documented limitation):** The regex patterns
+above are English-only. Injection in Hindi/Hinglish ("sab instructions ignore
+karo") or other scripts will NOT be caught by the pre-LLM screener. Mitigation:
+the Stage 1 and Stage 3 system prompt defenses are language-agnostic (the model
+understands "ignore instructions" in any language) — the model-level defense is
+the primary barrier; the regex screener is a secondary trip-wire for clear
+English attempts. Document as a known gap; do not claim full multilingual
+injection coverage.
+
 ---
 
 **Image Content Guardrails (Stage 2, local)**
@@ -3195,15 +3315,17 @@ valid_image count matches image count?    → else: repair loop
 
 **Stage 4b — Consistency Check (local, 0 tokens)**
 
-Six impossible combinations caught locally before any output is written:
+Five impossible combinations caught locally before any output is written:
 
 ```
 evidence_standard_met=false + claim_status=supported  → IMPOSSIBLE → repair
 severity=high + issue_type=none                        → IMPOSSIBLE → repair
 severity=none + claim_status=supported                 → IMPOSSIBLE → repair
-valid_image=false (all) + evidence_standard_met=true   → IMPOSSIBLE → repair
 claim_status=supported + supporting_image_ids="none"   → IMPOSSIBLE → repair
 claim_status=not_enough_information + severity=high    → IMPOSSIBLE → repair
+
+REMOVED — falsified by user_008 ground truth (false+true is a valid combination):
+  ✗ valid_image=false + evidence_standard_met=true → NOT impossible
 ```
 
 **Stage 4c — Repair Loop (via OpenRouter, ≤2 retries)**
@@ -3226,7 +3348,7 @@ def safe_defaults(claim: ClaimRow, reason: str) -> ClaimOutput:
     return ClaimOutput(
         user_id=claim.user_id,
         image_paths=claim.image_paths,
-        claim_text="[extraction failed]",
+        user_claim=claim.user_claim,        # echo input column verbatim
         claim_object=claim.claim_object,
         evidence_standard_met=False,
         evidence_standard_met_reason=f"System error: {reason}",
@@ -3236,7 +3358,7 @@ def safe_defaults(claim: ClaimRow, reason: str) -> ClaimOutput:
         claim_status="not_enough_information",
         claim_status_justification=f"System could not produce valid output: {reason}",
         supporting_image_ids="none",
-        valid_image=";".join(["false"] * max(claim.image_count, 1)),
+        valid_image=False,                  # single bool — not per-image format
         severity="unknown",
     )
 ```
@@ -3635,6 +3757,8 @@ All decisions are local — no extra tokens spent at the gate itself.
 │    no hedging language in justification                        │
 │    fewer than 2 risk flags                                     │
 │    Stage 2.5 local VLM did not say "unclear"                   │
+│    (if Stage 2.5 was skipped — CPU mode — this condition is    │
+│     vacuously met; Tier 0 only requires Stage 2.5 when it ran) │
 │                                                                 │
 │  Action: accept primary verdict, skip Stage 3.6               │
 │  Expected: ~70% of clean, unambiguous claims                   │
@@ -3684,18 +3808,23 @@ All decisions are local — no extra tokens spent at the gate itself.
 │                                                                 │
 │  Triggers (ANY):                                                │
 │    All three models disagree on claim_status                   │
-│    All three models confidence < 0.50                          │
+│                                                                 │
+│  NOTE: The original condition "all confidence < 0.50" was      │
+│  removed. VLMs are systematically overconfident (arXiv:        │
+│  2604.02543) — that threshold almost never fires in practice.  │
+│  Disagreement alone is the reliable trigger.                   │
 │                                                                 │
 │  Action: forced terminal state — no further API calls          │
 │    claim_status = not_enough_information                       │
-│    risk_flags  += [manual_review_required,                     │
-│                    model_consensus_conflict]                    │
-│    confidence   = 0.0                                          │
+│    risk_flags  += [manual_review_required]                     │
+│    (model_consensus_conflict remapped to manual_review_required│
+│     before writing output.csv — it is an internal-only flag)  │
+│    confidence   = 0.0  (internal tracking only, not output)    │
 │                                                                 │
 │  Justification template:                                        │
 │  "Models reached no consensus:                                 │
-│   Sonnet=[supported, 0.45] Gemini=[contradicted, 0.38]        │
-│   Llama=[not_enough_information, 0.52]                        │
+│   Sonnet=[supported] Gemini=[contradicted]                     │
+│   Llama=[not_enough_information]                               │
 │   Insufficient collective evidence to determine verdict."      │
 └─────────────────────────────────────────────────────────────────┘
 ```
