@@ -124,7 +124,8 @@ At least ONE image clearly supports + evidence standard met
 
 All usable images clearly contradict
   → claim_status = contradicted
-  → supporting_image_ids = "none" (contradicting ≠ supporting)
+  → supporting_image_ids = the image(s) that SHOW the contradicting evidence
+    (NOT "none" — ground truth populates this for every contradicted row)
 
 Images conflict (one supports, one contradicts)
   → claim_status = not_enough_information
@@ -184,33 +185,86 @@ The vision prompt explicitly teaches this framework to the model:
  NOT_ENOUGH_INFORMATION, not CONTRADICTED."
 ```
 
-### 3.7 Severity Alignment with Verdict
+### 3.7 Severity Alignment with Verdict (corrected against ground truth)
 
 ```
-claim_status = not_enough_information → severity = unknown (always)
-claim_status = contradicted + no damage → severity = none
-claim_status = contradicted + wrong damage → severity = unknown
+claim_status = not_enough_information → severity = unknown (always;
+                all 3 NEI ground-truth rows are "unknown")
+
 claim_status = supported → severity = low / medium / high based on image
-issue_type = none → severity must be none (caught by consistency check)
+
+claim_status = contradicted:
+  → NO damage visible on the claimed part → severity = none, issue_type = none
+    (user_020, user_034)
+  → DIFFERENT damage visible than claimed → severity reflects the damage that
+    IS visible, and issue_type = the visible issue type
+    (user_005: scratch/low · user_008: broken_part/high · user_033: low)
+  → contradicted does NOT force severity to "unknown" (old rule was wrong)
+
+issue_type = "none" → severity must be "none" (caught by consistency check)
 ```
 
-### 3.8 Supporting Image IDs — Rules
+**issue_type on NEI is NOT forced to "unknown".** When the claim/close-up makes
+the claimed issue clear but the set is inconclusive, issue_type carries the
+claimed/observed type (user_002: NEI with issue_type=`broken_part`). Use
+`unknown` only when the issue itself cannot be determined (user_006, user_032).
+
+### 3.9 valid_image — An Independent Axis (corrected against ground truth)
+
+`valid_image` is "is this image usable/trustworthy for AUTOMATED review" and is
+**independent** of both `evidence_standard_met` and `supporting_image_ids`.
+All three cross-combinations appear in ground truth:
+
+```
+valid_image | evidence_standard_met | example
+────────────┼───────────────────────┼─────────────────────────────────────────
+true        | false                 | user_002 (valid photos, but of different cars)
+false       | false                 | user_032
+false       | true                  | user_008 ← image clearly shows damage
+            |                       |            (high severity, contradicted)
+            |                       |            yet flagged not auto-trustworthy
+```
+
+Consequences (these were WRONG in earlier drafts and are now removed):
+- There is NO rule "valid_image=false ⇒ evidence_standard_met=false".
+- `supporting_image_ids` MAY reference an image with `valid_image=false`.
+- Set `valid_image` from a dedicated authenticity/usability judgment, then
+  calibrate the threshold against the 20 sample rows during evaluation —
+  do not derive it from evidence_standard_met or the pre-filters.
+
+### 3.8 Supporting Image IDs — Rules (corrected against ground truth)
+
+`supporting_image_ids` lists the image(s) the determination is GROUNDED in —
+the evidentiary images the verdict actually relies on. It is **not** gated by
+verdict polarity. Ground truth populates it for `supported` AND `contradicted`,
+and for `not_enough_information` when usable images informed the (inconclusive)
+read. Read it as "which images did the decision rely on," not "which images
+prove the claim true."
 
 ```
 claim_status = supported:
-  → supporting_image_ids = IDs of images that show the damage
-  → not all images, only the ones that constitute evidence
-  → never empty when status = supported
+  → IDs of the image(s) that show the CONFIRMING evidence
+  → the evidentiary subset only, not every submitted image
+    (user_030: 2 images submitted, img_1 shows the torn seal, img_2 is just
+     context → supporting_image_ids = "img_1")
+  → never "none" when status = supported
 
 claim_status = contradicted:
-  → supporting_image_ids = "none"
-  → contradicting images do not "support" the claim
+  → IDs of the image(s) that show the CONTRADICTING evidence — POPULATED
+  → all 5 contradicted ground-truth rows populate this field
+    (user_005, user_008, user_020, user_033, user_034)
   → the justification explains what the image shows instead
 
 claim_status = not_enough_information:
-  → supporting_image_ids = "none"
-  → no image supported the claim
+  → IDs of the image(s) that depict the object/part but were inconclusive
+    (user_002: two valid images of different cars → "img_1;img_2")
+  → "none" ONLY when no usable/relevant image exists
+    (user_006, user_032 → "none")
 ```
+
+An image may appear in `supporting_image_ids` even when `valid_image = false`
+(user_008: `valid_image=false`, `supporting_image_ids="img_1"`). The two fields
+are independent — see §3.9.
 
 ---
 
@@ -868,8 +922,9 @@ No `ANTHROPIC_API_KEY`. No `GOOGLE_API_KEY`. OpenRouter proxies everything.
 │  4b. CONSISTENCY CHECK (local, 0 tokens)                        │
 │      → justification contradicts verdict?                      │
 │      → severity=high but issue_type=none?                      │
-│      → evidence_met=true but valid_image=false?        │
-│      → supporting_ids populated when claim_status=contradicted?│
+│      → NEI but severity ≠ unknown?                             │
+│      → issue_type=none but severity ≠ none?                    │
+│      → supporting_ids reference an image not in THIS claim?    │
 │                                                                 │
 │  4c. REPAIR LOOP                                                │
 │      Via OpenRouter → claude-haiku-4-5 │ gemini-2.5-flash      │
@@ -1318,13 +1373,13 @@ Each case produces an output that must be caught and fixed before writing to out
 | ID | Scenario | Violation | Handler |
 |---|---|---|---|
 | SC1 | Model outputs `issue_type="glass_shatter"` for a package claim | Wrong object-type mapping for issue_type | Repair: "glass_shatter is not valid for package; valid: torn_packaging, water_damage, stain, missing_part" |
-| SC2 | Model outputs `supporting_image_ids` referencing a blurry (invalid) image | Invalid image cannot be a supporting image | Repair: "supporting_image_ids must only reference images that passed pre-filters" |
+| SC2 | Model outputs `supporting_image_ids` referencing an image that FAILED the readability pre-filter (blank / corrupt / missing) | Unreadable images cannot ground a determination | Repair: only reference images that passed the readability pre-filter. NOTE: a readable image whose `valid_image=false` MAY still be cited (user_008) — do not over-strip on valid_image alone |
 | SC3 | Model outputs `object_part="unknown"` when part IS clearly visible | Inconsistency with visual evidence | Repair loop targets this field specifically |
 | SC4 | `severity="high"` + `issue_type="none"` | Impossible combination | Caught by Stage 4b rule 1 |
 | SC5 | `evidence_standard_met=false` + `claim_status="supported"` | Impossible combination | Caught by Stage 4b rule 6 |
 | SC6 | `risk_flags` contains duplicate flags (`"blurry_image;blurry_image"`) | Redundant, may confuse downstream | Repair: deduplicate flags |
 | SC7 | `valid_image=true` but all images failed pre-filter (blank/corrupt/missing) | Impossible combination | Force `valid_image=false`; re-run Stage 3 consistency check |
-| SC8 | `claim_status="contradicted"` + `supporting_image_ids` populated | Contradicted claims have no supporting images | Caught by Stage 4b rule 5 |
+| SC8 | `claim_status="contradicted"` + `supporting_image_ids="none"` while a usable image shows the contradicting evidence | Contradicted verdicts must cite the evidentiary image (ground truth always populates it) | Repair: cite the image that shows the contradicting evidence |
 | SC9 | `claim_status="not_enough_information"` + `severity="high"` | NEI = unknown severity | Caught by Stage 4b; severity forced to `unknown` |
 | SC10 | All 14 fields present but `claim_status_justification` is one word ("unclear") | Insufficient justification | Repair: "justification must reference specific visual evidence" |
 | SC11 | Model outputs extra fields not in schema (`"notes": "..."`) | Pydantic validation rejects extra fields | Pydantic `model_config = ConfigDict(extra="forbid")` |
@@ -1672,7 +1727,7 @@ From `evidence_requirements.csv` — loaded at startup, checked locally in Stage
 | `evidence_standard_met_reason` | string | Free text explanation |
 | `risk_flags` | string | Semicolon-separated list |
 | `issue_type` | string | dent, scratch, crack, glass_shatter, broken_part, missing_part, torn_packaging, crushed_packaging, water_damage, stain, none, unknown |
-| `object_part` | string | Specific part name |
+| `object_part` | string | Observed vocab — car: rear_bumper, front_bumper, windshield, side_mirror, headlight, door, hood · laptop: screen, keyboard, trackpad, hinge, corner · package: package_corner, package_side, seal, contents · fallback: unknown |
 | `claim_status` | string | supported, contradicted, not_enough_information |
 | `claim_status_justification` | string | Evidence-grounded explanation |
 | `supporting_image_ids` | string | Semicolon-separated image IDs or "none" |
@@ -1683,12 +1738,70 @@ From `evidence_requirements.csv` — loaded at startup, checked locally in Stage
 
 ```
 severity=high         → issue_type must not be "none"
-severity=none         → issue_type should be "none" or "unknown"
-valid_image=false → evidence_standard_met must be false
+issue_type="none"     → severity must be "none"
+claim_status=not_enough_information → severity must be "unknown"
 evidence_met=true     → at least one supporting_image_id must exist
-claim_status=not_enough_information → supporting_image_ids should be "none"
-supporting_image_ids  → must only reference IDs from submitted images for this claim
+supporting_image_ids  → must only reference IDs from images submitted for THIS claim
+                        (MAY reference an image whose valid_image=false — user_008)
+
+REMOVED (falsified by ground truth, do not re-add):
+  ✗ valid_image=false → evidence_standard_met=false   (user_008: false + true)
+  ✗ contradicted      → supporting_image_ids="none"   (all 5 contradicted populate it)
+  ✗ NEI               → supporting_image_ids="none"   (user_002 populates it)
 ```
+
+### 11.1 Ground-Truth Calibration Table (all 20 sample rows)
+
+> ⚠️ **COMPLIANCE FENCE.** The README forbids "hardcoded test labels or
+> file-specific answers." This table exists ONLY to (a) derive general
+> consistency rules and (b) score the eval harness in `code/evaluation/`. It
+> MUST NOT be imported, referenced, or keyed by `user_id`/`case_id` anywhere on
+> the `claims.csv` production path. The pipeline reasons from image + claim
+> every time; it never looks a row up here. Treat any `user_id`→answer mapping
+> in production code as a disqualifying bug.
+
+This is the authoritative reference. The eval harness asserts against it; any
+consistency rule we write must hold for every row below.
+
+| user | object | claim_status | support_ids | valid_img | ev_met | issue_type | severity | #imgs |
+|---|---|---|---|---|---|---|---|---|
+| user_001 | car | supported | img_1 | true | true | dent | medium | 1 |
+| user_002 | car | not_enough_information | img_1;img_2 | true | **false** | broken_part | unknown | 2 |
+| user_003 | car | supported | **img_2** | true | true | dent | medium | 2 |
+| user_004 | car | supported | img_1 | true | true | crack | medium | 2 |
+| user_005 | car | **contradicted** | **img_1** | true | true | scratch | **low** | 2 |
+| user_006 | car | not_enough_information | none | true | false | unknown | unknown | 1 |
+| user_007 | car | supported | img_1 | true | true | broken_part | medium | 1 |
+| user_008 | car | **contradicted** | **img_1** | **false** | **true** | broken_part | **high** | 1 |
+| user_009 | laptop | supported | img_1 | true | true | crack | medium | 1 |
+| user_010 | laptop | supported | img_1 | true | true | broken_part | medium | 2 |
+| user_011 | laptop | supported | img_1 | true | true | stain | medium | 1 |
+| user_012 | laptop | supported | **img_2** | true | true | dent | low | 2 |
+| user_018 | laptop | supported | img_1 | true | true | crack | medium | 1 |
+| user_020 | laptop | **contradicted** | **img_1** | true | true | none | none | 1 |
+| user_015 | package | supported | img_1 | true | true | crushed_packaging | medium | 1 |
+| user_030 | package | supported | **img_1** | true | true | torn_packaging | medium | 2 |
+| user_031 | package | supported | img_1 | true | true | water_damage | medium | 1 |
+| user_032 | package | not_enough_information | none | **false** | false | unknown | unknown | 2 |
+| user_033 | package | **contradicted** | **img_1** | true | true | unknown | **low** | 1 |
+| user_034 | package | **contradicted** | **img_1;img_2** | true | true | none | none | 2 |
+
+**Invariants that DO hold across all 20 rows (safe to enforce):**
+- Every `supported` row → `evidence_standard_met=true` and `supporting_image_ids ≠ none`.
+- Every `not_enough_information` row → `severity=unknown`.
+- Every `contradicted` row → `supporting_image_ids ≠ none` (all 5 populate it).
+- `issue_type=none` ⇔ `severity=none` (user_020, user_034).
+- `severity ∈ {low,medium,high}` only when an issue is actually visible
+  (supported, or contradicted-with-different-damage).
+
+**Distributions worth noting for the eval harness:**
+- Verdicts: 12 supported · 5 contradicted · 3 NEI. (Class imbalance — the
+  cheap baseline of "always supported" would score 12/20; our system must beat
+  that decisively on contradicted + NEI, which are the harder, higher-value cases.)
+- Objects: 8 car · 6 laptop · 6 package.
+- `supporting_image_ids` is a strict subset of submitted images in the 2-image
+  supported cases (user_003→img_2, user_012→img_2, user_030→img_1) — picking the
+  RIGHT image, not all images, is graded.
 
 ---
 
@@ -2253,19 +2366,31 @@ If repair_attempts > 0 → repair loop fixed real failures
 | A12 | Homogeneous ensemble | Replace Gemini+Llama with Haiku+Haiku | arXiv:2511.15714 diversity benefit |
 | A13 | No confidence self-report | Remove confidence field from prompt | arXiv:2604.02543 overconfidence inflation |
 | A14 | FFT + EXIF + semantic AI check | Add diffusion-era fraud detection on top of FFT | arXiv:2510.19957 generative AI fraud |
+| A15 | supporting_image_ids: cite-all vs cite-evidentiary-subset | Whether to list every submitted image or only the image(s) the verdict relies on | Ground-truth grading — user_003/012/030 cite a strict subset; cite-all would mismatch |
+| A16 | valid_image: derive-from-prefilter vs dedicated-judgment | Whether valid_image is set from readability pre-filters or a separate authenticity/usability judgment | Ground-truth grading — user_008 has valid_image=false on a readable image that meets the evidence standard; pre-filter derivation gets this wrong |
+
+A15 and A16 are not research-driven — they are **directly graded behaviors** the
+sample answers expose. They are the cheapest high-yield ablations we have, because
+each is a small code change scored against 20 labeled rows in §11.1.
 
 ### 22.5 Minimum Ablations for Submission
 
-If time is limited, run at least these six:
+If time is limited, run at least these eight:
 
 ```
 Priority 1: A0 vs A1   (Strategy B vs Strategy A — primary comparison)
 Priority 2: A0 vs A2   (with vs without consensus — novel contribution)
-Priority 3: A0 vs A5   (with vs without resize — cost assumption)
-Priority 4: A0 vs A9   (two-call vs one-call Stage 3 — anchoring bias, research-backed)
-Priority 5: A0 vs A11  (weighted vs simple majority — ensemble quality)
-Priority 6: A0 vs A14  (FFT only vs FFT+diffusion check — generative AI fraud gap)
+Priority 3: A0 vs A15  (subset vs all supporting_image_ids — directly graded)
+Priority 4: A0 vs A16  (dedicated vs derived valid_image — directly graded)
+Priority 5: A0 vs A5   (with vs without resize — cost assumption)
+Priority 6: A0 vs A9   (two-call vs one-call Stage 3 — anchoring bias, research-backed)
+Priority 7: A0 vs A11  (weighted vs simple majority — ensemble quality)
+Priority 8: A0 vs A14  (FFT only vs FFT+diffusion check — generative AI fraud gap)
 ```
+
+A15 and A16 jump to the top because they are scored against the labeled sample set
+directly — they convert "design intuition" into measured points before any model
+call is even made.
 
 These six answer every likely judge question:
 1. "Is your complex pipeline better than a simple approach?" → A0 vs A1
@@ -2349,10 +2474,12 @@ from pydantic import BaseModel, field_validator
 from typing import Literal
 
 class ClaimOutput(BaseModel):
+    # --- 4 echoed input columns (verbatim, never rewritten) ---
     user_id: str
     image_paths: str
-    claim_text: str
+    user_claim: str          # echo input EXACTLY — column is "user_claim", not "claim_text"
     claim_object: Literal["car", "laptop", "package"]
+    # --- 10 produced columns ---
     evidence_standard_met: bool
     evidence_standard_met_reason: str
     risk_flags: str                    # semicolon-separated
@@ -2383,6 +2510,26 @@ class ClaimOutput(BaseModel):
         return v
 ```
 
+**Output vocabulary guard — `model_consensus_conflict` is INTERNAL ONLY.**
+The 11 risk flags observed in ground truth are: `none`, `blurry_image`,
+`cropped_or_obstructed`, `claim_mismatch`, `user_history_risk`,
+`manual_review_required`, `wrong_object`, `wrong_angle`, `damage_not_visible`,
+`non_original_image`, `text_instruction_present`. `model_consensus_conflict` is
+our own internal signal and never appears in the sanctioned set — when it fires,
+map it to `manual_review_required` before writing `output.csv`. Never emit an
+out-of-vocabulary flag.
+
+**CSV serialization — booleans must be lowercase.** `evidence_standard_met` and
+`valid_image` must serialize to the literal strings `true` / `false` (as in the
+ground truth), NOT Python's default `True` / `False`. The output writer
+lowercases booleans explicitly; do not rely on `str(bool)`.
+
+**Output column order is fixed** and must match the header exactly:
+`user_id, image_paths, user_claim, claim_object, evidence_standard_met,
+evidence_standard_met_reason, risk_flags, issue_type, object_part, claim_status,
+claim_status_justification, supporting_image_ids, valid_image, severity`
+(4 echoed inputs + 10 produced = 14 columns, one row per input row).
+
 Input rows, preprocessed images, user history — all Pydantic models.
 Nothing flows between pipeline stages as a raw dict.
 
@@ -2402,10 +2549,13 @@ class Config:
     openrouter_api_key: str = field(
         default_factory=lambda: os.environ["OPENROUTER_API_KEY"]
     )
-    primary_model: str = "anthropic/claude-haiku-4-5"
-    strategy_a_model: str = "anthropic/claude-sonnet-4-6"
-    crosscheck_model_a: str = "google/gemini-2.5-flash"
-    crosscheck_model_b: str = "meta-llama/llama-3.2-11b-vision-instruct"
+    # Stage-named so there is no ambiguity with ablation "Strategy A/B" labels.
+    stage1_model: str = "anthropic/claude-haiku-4-5"          # transcript parse (cheap text)
+    stage3_primary_model: str = "anthropic/claude-sonnet-4-6" # Stage 3 visual reasoning (GPU path)
+    stage3_primary_cpu_fallback: str = "anthropic/claude-haiku-4-5"  # if no local GPU
+    stage3_repair_model: str = "anthropic/claude-haiku-4-5"   # targeted Stage 4c repair
+    crosscheck_model_a: str = "google/gemini-2.5-flash"       # free tier
+    crosscheck_model_b: str = "meta-llama/llama-3.2-11b-vision-instruct"  # free tier
 
     # Image preprocessing
     resize_max_px: int = 768
