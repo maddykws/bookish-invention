@@ -2592,6 +2592,58 @@ CFG = Config()   # singleton — import this everywhere
 
 ---
 
+### 23.3b Dependency Strategy — Graceful Degradation (decided)
+
+The dependency surface is split into three buckets so the system **always runs**
+in the grader's environment, GPU or not. This directly targets last cycle's weak
+spot (3/30 technical execution = "it didn't run cleanly"):
+
+```
+requirements.txt          CORE — torch-free, always installs. Runs the full
+                          cloud-first pipeline and produces output.csv.
+requirements-local.txt    OPTIONAL — torch/torchvision/transformers/ultralytics/
+                          sentence-transformers. GPU pre-checks (Stage 2.5, 2g).
+requirements-dev.txt      OPTIONAL — langfuse/phoenix/deepeval/gradio/pytest.
+                          Observability, richer eval, demo UI.
+```
+
+**The heavy stack is never a hard dependency.** Every local-vision component is
+import-guarded; if its library is missing, the pipeline degrades to OpenRouter
+vision and records the degradation, rather than crashing.
+
+```python
+# code/capabilities.py — probed once at Stage 0, stored on Config
+def detect_capabilities() -> dict[str, bool]:
+    caps = {"torch": False, "cuda": False, "ultralytics": False,
+            "transformers": False, "sentence_transformers": False}
+    try:
+        import torch
+        caps["torch"] = True
+        caps["cuda"] = torch.cuda.is_available()
+    except ImportError:
+        pass
+    for name in ("ultralytics", "transformers", "sentence_transformers"):
+        try:
+            __import__(name); caps[name] = True
+        except ImportError:
+            pass
+    return caps
+
+# Degradation rules applied at Stage 0:
+#   no torch / no cuda          → use_local_vlm = False (Stage 2.5 skipped)
+#   no ultralytics              → YOLO pre-detect skipped (CLIP/Sonnet still run)
+#   no transformers             → use_clip = False (Stage 2g skipped)
+#   no sentence_transformers    → ChromaDB falls back to its built-in ONNX embedder
+# In every case Stage 3 (OpenRouter Sonnet 4.6) still runs → correctness preserved.
+```
+
+Two consequences for the eval report: (1) the same code produces output.csv on a
+laptop with no GPU and on a CUDA box — only cost/latency differ; (2) ablations A3
+(no local VLM) and A4 (no CLIP) are obtained "for free" by running on a CPU-only
+box, since degradation is the ablation.
+
+---
+
 ### 23.4 Logging — Rich + Python logging, Zero print()
 
 ```python
@@ -2745,7 +2797,11 @@ If it crashes, is empty, or produces no comparison — technical score tanks.
 ## Setup
 
 1. Clone and install:
-   pip install -r requirements.txt
+   pip install -r requirements.txt          # core — enough to run end-to-end
+   # optional, only if you have a CUDA GPU and want local pre-checks:
+   #   pip install -r requirements-local.txt
+   # optional, for tracing / richer eval / demo UI:
+   #   pip install -r requirements-dev.txt
 
 2. Set environment variable:
    export OPENROUTER_API_KEY=your_key_here
@@ -2764,50 +2820,61 @@ If setup takes more than 2 minutes, judges mark it down.
 
 ---
 
-### 23.10 requirements.txt — Complete and Pinned
+### 23.10 requirements — Three Buckets (see §23.3b for the strategy)
+
+Authoritative files live at the repo root: `requirements.txt` (core),
+`requirements-local.txt` (optional GPU vision), `requirements-dev.txt` (optional
+observability/eval/UI). The split exists so the core always installs torch-free
+and the pipeline degrades gracefully — never crashes — when the heavy stack is
+absent.
 
 Last-time components reviewed and deliberately excluded:
 - `langchain` → deterministic pipeline, not a reasoning agent
-- `openai` text-embedding-3-large → replaced by sentence-transformers (local, free, no extra key)
+- `openai` text-embedding-3-large → ChromaDB's ONNX embedder (core) / sentence-transformers (optional); no extra key
 - `cohere` rerank-v3.5 → adds a third API key with no clear benefit in our pipeline
 - `lancedb` → ChromaDB already in codebase, same job
 - `textual` → Rich is sufficient for batch pipeline output
+- `litellm` / `anthropic` / `pydantic-ai` → the `openai` SDK pointed at OpenRouter is the single spine; no second client
 
 ```
-# API (OpenRouter — single key, OpenAI-compatible)
-openai>=1.50.0
-
-# Core
+# ── requirements.txt (CORE — torch-free, always installs) ───────────────
+openai>=1.50.0                  # OpenRouter spine (OpenAI-compatible)
 pydantic>=2.7.0
 python-dotenv>=1.0.0
-
-# Image processing
+requests>=2.31.0                # OpenRouter generation API polling
 pillow>=10.0.0
-opencv-python>=4.9.0
-numpy>=1.26.0
-
-# Local models (optional — GPU path)
-torch>=2.3.0
-torchvision>=0.18.0
-transformers>=4.40.0    # Qwen2-VL, Llama vision
-ultralytics>=8.2.0      # YOLO v8
-
-# Semantic memory + cross-claim fraud detection
-chromadb>=0.5.0
-sentence-transformers>=3.0.0   # all-MiniLM-L6-v2, local, no API key
-
-# CLI + logging
+numpy>=1.26.0                   # FFT + histogram blank detection
+opencv-python-headless>=4.9.0   # Laplacian blur (headless: no X11 on servers)
+pandas>=2.2.0
 rich>=13.7.0
 tqdm>=4.66.0
+pyyaml>=6.0.0
+chromadb>=0.5.0                 # cross-claim fraud; built-in ONNX embedder (no torch)
 
-# Data
-pandas>=2.2.0
+# ── requirements-local.txt (OPTIONAL — GPU vision; import-guarded) ───────
+torch>=2.3.0
+torchvision>=0.18.0
+transformers>=4.40.0            # Qwen2-VL / Llama-Vision (Stage 2.5) + CLIP (Stage 2g)
+ultralytics>=8.2.0             # YOLOv8 object pre-detect
+sentence-transformers>=3.0.0   # higher-quality cross-claim embeddings
 
-# Dev + eval
+# ── requirements-dev.txt (OPTIONAL — observability / eval / UI) ──────────
+langfuse>=2.0.0
+arize-phoenix>=5.0.0
+openinference-instrumentation-openai>=0.1.0
+opentelemetry-api>=1.28.0
+opentelemetry-sdk>=1.28.0
+deepeval>=1.0.0
+gradio>=4.0.0
 pytest>=8.0.0
 ```
 
-No LangChain. No Cohere. No LanceDB. No Textual.
+Why `opencv-python-headless` not `opencv-python`: the headless wheel drops the
+GUI/X11 system libraries that the standard wheel needs, which are absent on most
+CI/grader containers and are a classic silent install failure. We never call
+`cv2.imshow`, so headless is strictly safer.
+
+No LangChain. No Cohere. No LanceDB. No Textual. No second LLM client.
 One external API key: `OPENROUTER_API_KEY` only.
 
 ---
