@@ -1511,6 +1511,135 @@ These test the pipeline at the batch level — not individual claim correctness.
 
 ---
 
+### 9.26 Research-Grounded Failure Modes
+
+These scenarios are derived from peer-reviewed findings on VLM failure modes.
+Each is backed by a specific paper and reveals a real gap in naïve pipelines.
+
+---
+
+**A. Format Sensitivity** *(arXiv:2511.10075 — "Format Matters")*
+
+Multimodal LLMs are brittle to how evidence is presented, not just what it contains.
+Format changes alone can flip a verdict — without changing a single pixel or word.
+
+| ID | Scenario | Research Finding | Our Mitigation |
+|---|---|---|---|
+| RF1 | Image presented as base64 vs file path reference | Verdict can differ by format alone | Always embed image bytes directly; never rely on URL reference in prompt |
+| RF2 | Claim text in a markdown table vs plain prose | Structured format shifts model attention | Use plain prose; no markdown tables in claim input |
+| RF3 | Evidence summary block vs bullet list vs paragraph | Layout changes verdict on borderline cases | Fixed prompt template; no format variation between claims |
+| RF4 | JSON schema shown to model vs schema described in natural language | Schema format affects output compliance | Always show exact JSON schema with field names and types in prompt |
+
+**Mitigation:** prompt template is fixed and version-controlled. No dynamic format variation per claim.
+
+---
+
+**B. AI-Generated Damage Evidence** *(arXiv:2510.19957 — "New Wave of Vehicle Insurance Fraud via Generative AI")*
+
+Diffusion models (Stable Diffusion, DALL-E, Midjourney) generate realistic damage images
+that **pass FFT noise checks**. FFT detects GAN artifacts — not diffusion artifacts.
+This is a known gap in our Stage 2 adversarial check as of 2025.
+
+| ID | Scenario | Why FFT Fails | Additional Check |
+|---|---|---|---|
+| AI1 | Diffusion-generated car dent on correct make/model | Diffusion has no GAN frequency artifacts | Semantic inconsistency: too-perfect damage, unrealistic lighting direction |
+| AI2 | AI-generated image edited onto real photo background | Composite: real background + generated damage | Edge discontinuity detection at damage boundary |
+| AI3 | Real damage photo + AI-enhanced severity (inpainting) | Original photo base passes FFT | Localized noise pattern inconsistency at damage region |
+| AI4 | AI-generated image using photo of user's actual car | Correct vehicle identity, fabricated damage | EXIF absent (AI images have no camera metadata) + semantic check |
+| AI5 | Fraud ring using prompt-engineered damage: "Honda Civic rear bumper dent, photorealistic" | Bypasses hash collision (unique per generation) | EXIF absent + semantic inconsistency + ChromaDB semantic similarity to known fraud patterns |
+
+**Gap acknowledged in design:** Our FFT check catches GAN-era fraud. Diffusion-era fraud requires:
+1. EXIF absence as a signal (no camera metadata = possible AI generation)
+2. Semantic inconsistency detection (lighting, shadow direction, material texture) in Stage 3 prompt
+3. Explicit prompt instruction: *"Are there signs this image was AI-generated? Look for perfect-looking damage, inconsistent shadows, unnatural material textures."*
+
+---
+
+**C. Multi-Image Position Bias** *(arXiv:2503.13792 — "Position Bias in Multi-image VLMs")*
+
+VLMs show measurable bias toward images presented first or last.
+When multiple images are submitted, the verdict can change based solely on image order.
+
+| ID | Scenario | Position Bias Effect | Our Mitigation |
+|---|---|---|---|
+| PB1 | img_1=clean, img_2=damaged → verdict: supported | vs img_1=damaged, img_2=clean → also supported? | Always sort images by damage signal strength (most informative first) |
+| PB2 | First image is irrelevant (wrong angle) — model anchors on it and discounts later useful image | Primacy bias → NEI even when evidence exists | Sort: valid images before invalid; flag-free images before flagged |
+| PB3 | Last image is a repeat of first (same hash) — recency bias inflates confidence | Recency bias on duplicate | SHA-256 dedup removes last-position duplicate |
+| PB4 | 5 images: 4 clean, 1 damaged at position 3 — buried in middle | Middle images underweighted | Process each image independently in Stage 3; aggregate after |
+
+**Mitigation:** Each image gets an independent Stage 3 analysis call. Final verdict aggregates independent analyses, not a single call with all images in sequence. This breaks position bias by eliminating positional context entirely.
+
+---
+
+**D. Anchoring Bias Despite Image-First Prompt** *(arXiv:2602.06176 — "LLM Reasoning Failures")*
+
+Even with image-first prompting, a sufficiently detailed or technical claim transcript
+can retroactively alter how the model reports what it saw in the image.
+
+| ID | Scenario | Failure Mode | Our Defense |
+|---|---|---|---|
+| AB1 | User provides extremely detailed technical description of damage before model reads image | Anchoring: model's Step 1 visual description is biased toward confirming the text it knows is coming | Image-first ordering; Step 1 must be submitted as separate call with no claim text |
+| AB2 | Agent in transcript coaches user with exact damage descriptions ("tell them about the rear bumper crack") | Coached claim creates anchoring pressure | Prompt: "Describe what you see. Do not read the claim until instructed." |
+| AB3 | Repair estimate document included in transcript (dollar amount and damage type) | Financial anchor biases severity assessment | Transcript truncated to 8 turns; repair estimates stripped by Stage 1 parser |
+
+**Strongest mitigation:** Split Stage 3 into two separate API calls:
+- **Call 3a:** Image only + "Describe what you see. Do not make any claims assessment yet." → raw visual description
+- **Call 3b:** Visual description from 3a + claim text + evidence requirements → verdict
+
+This is more expensive (~300 extra tokens) but eliminates anchoring entirely. Add as **ablation A9** (two-call vs one-call Stage 3).
+
+---
+
+**E. VLM Systematic Overconfidence** *(arXiv:2604.02543 — "Overconfidence in Medical VQA")*
+
+VLMs are systematically overconfident. A model outputting `confidence=0.9` can be wrong
+30–40% of the time on visually ambiguous cases. Confidence is not a probability.
+
+| ID | Scenario | Overconfidence Pattern | Consequence |
+|---|---|---|---|
+| OC1 | Clear damage, easy case → confidence=0.97 | Appropriate — easy cases are well-calibrated | Fast path correctly taken |
+| OC2 | Ambiguous damage (borderline blur, partial visibility) → confidence=0.87 | Overconfident on hard cases | Tier 0 fast path taken when Tier 1 escalation was needed |
+| OC3 | Model confidently says "supported" for AI-generated image → confidence=0.92 | Semantically coherent images receive high confidence even when fake | FFT + EXIF checks are the last line; Stage 3 alone is insufficient |
+| OC4 | All 3 models agree on wrong verdict with high confidence | Correlated overconfidence — same visual feature fools all three | No mitigation beyond human review; documented as known limitation |
+| OC5 | Model outputs confidence=0.95 on NEI case (genuinely uncertain) | Most dangerous: confident and wrong | Confidence gate + caution bias: if verdict is NEI, confidence is irrelevant — NEI stands |
+
+**Implication for our system:** Confidence scores from self-report are useful for escalation triggering but must NOT be treated as calibrated probabilities. Our calibration caveat (Section 27.5) is validated by this research.
+
+---
+
+**F. Ensemble Correlation Failure** *(arXiv:2511.15714 — "Majority Rules"; arXiv:2604.02923 — "Council Mode")*
+
+Ensemble accuracy gains vanish when models share the same training data or architecture.
+Three models from the same family fail together on the same inputs.
+
+| ID | Scenario | Correlation Risk | Our Mitigation |
+|---|---|---|---|
+| EC1 | Sonnet + Gemini + Llama all agree on wrong verdict (shared visual blind spot) | All three share training on internet images — same gaps | Cannot fully mitigate; documented as known limitation |
+| EC2 | Two same-family models (Haiku + Haiku) used instead of diverse models | Identical errors — ensemble provides no benefit | Design uses three different model families: Anthropic, Google, Meta |
+| EC3 | Gemini and Llama are both free-tier, smaller models — may systematically disagree with Sonnet on nuanced cases | Smaller models have lower visual reasoning — systematic bias not random | Weighted aggregation gives Sonnet 0.5 weight; minority of larger model is preserved |
+| EC4 | All three models trained heavily on text; visual grounding fails on novel damage types | Shared visual pre-training on similar datasets | Local VLM (Stage 2.5) as independent check; entirely different architecture |
+
+**Validated by our design choice:** Sonnet (Anthropic) + Gemini Flash (Google) + Llama Vision (Meta) — three different training pipelines, three different visual encoders, three different RLHF pipelines. This maximises independence of errors.
+
+---
+
+### 9.27 Additional Ablation Scenarios (Research-Derived)
+
+These extend the ablation study in Section 22 with experiments motivated by the papers above.
+
+| ID | Ablation | Removes / Changes | Research Motivation |
+|---|---|---|---|
+| A9 | Two-call Stage 3 (3a image-only + 3b verdict) vs one-call | Separates visual description from verdict generation | arXiv:2602.06176 — anchoring bias; costs ~300 extra tokens |
+| A10 | Independent per-image analysis vs joint multi-image call | Breaks position bias by removing image order | arXiv:2503.13792 — position bias in multi-image VLMs |
+| A11 | Weighted consensus (Sonnet 0.5) vs simple majority vote | Changes aggregation formula | arXiv:2406.07791 — quality gap affects position bias magnitude |
+| A12 | Heterogeneous models (Sonnet+Gemini+Llama) vs homogeneous (Sonnet+Haiku+Haiku) | Tests ensemble diversity benefit | arXiv:2511.15714 — same-family models share errors |
+| A13 | Confidence self-report included in prompt vs excluded | Tests whether asking for confidence changes verdict quality | arXiv:2604.02543 — VLMs are overconfident when asked to self-report |
+| A14 | FFT check only vs FFT + EXIF absence + semantic inconsistency check | Tests diffusion fraud detection gap | arXiv:2510.19957 — diffusion images pass FFT |
+
+**These 6 new ablations bring total to A0–A14 (15 variants).** Run A9, A11, A14 as the new minimum set alongside the existing Priority 1–3.
+
+---
+
 ## 10. Evidence Requirements Mapping
 
 From `evidence_requirements.csv` — loaded at startup, checked locally in Stage 4b:
@@ -2105,29 +2234,55 @@ If repair_attempts > 0 → repair loop fixed real failures
 
 ---
 
-### 22.4 Minimum Ablations for Submission
+### 22.4 Full Ablation Matrix (A0–A14)
 
-If time is limited, run at least these three:
+| ID | Name | What Changes | Research Basis |
+|---|---|---|---|
+| A0 | Full Strategy B | Baseline — all components on | — |
+| A1 | Strategy A (single Sonnet call) | No cascade, no consensus, no local preprocessing | Baseline comparison |
+| A2 | No consensus | Skip Stages 3.5–3.7 | Novel contribution test |
+| A3 | No local VLM | Skip Stage 2.5 | GPU value test |
+| A4 | No CLIP | Skip Stage 2g | Semantic pre-check value |
+| A5 | No resize | Full-resolution images to Stage 3 | Cost assumption validation |
+| A6 | Claim-first prompt | Reverse prompt order: claim before image | arXiv:2602.06176 anchoring bias |
+| A7 | No fraud checks | Skip SHA-256, FFT, EXIF | Fraud detection value |
+| A8 | No repair loop | Skip Stage 4c | Repair value test |
+| A9 | Two-call Stage 3 | Split into 3a (image-only) + 3b (verdict) | arXiv:2602.06176 anchoring elimination |
+| A10 | Per-image independent calls | One Stage 3 call per image; aggregate after | arXiv:2503.13792 position bias |
+| A11 | Simple majority vote | Replace weighted consensus with equal weights | arXiv:2406.07791 quality gap effect |
+| A12 | Homogeneous ensemble | Replace Gemini+Llama with Haiku+Haiku | arXiv:2511.15714 diversity benefit |
+| A13 | No confidence self-report | Remove confidence field from prompt | arXiv:2604.02543 overconfidence inflation |
+| A14 | FFT + EXIF + semantic AI check | Add diffusion-era fraud detection on top of FFT | arXiv:2510.19957 generative AI fraud |
+
+### 22.5 Minimum Ablations for Submission
+
+If time is limited, run at least these six:
 
 ```
-Priority 1: A0 vs A1  (Strategy B vs Strategy A — the primary comparison)
-Priority 2: A0 vs A2  (with vs without consensus — the novel contribution)
-Priority 3: A0 vs A5  (with vs without resize — validates cost assumption)
+Priority 1: A0 vs A1   (Strategy B vs Strategy A — primary comparison)
+Priority 2: A0 vs A2   (with vs without consensus — novel contribution)
+Priority 3: A0 vs A5   (with vs without resize — cost assumption)
+Priority 4: A0 vs A9   (two-call vs one-call Stage 3 — anchoring bias, research-backed)
+Priority 5: A0 vs A11  (weighted vs simple majority — ensemble quality)
+Priority 6: A0 vs A14  (FFT only vs FFT+diffusion check — generative AI fraud gap)
 ```
 
-These three together answer the three most likely judge questions:
+These six answer every likely judge question:
 1. "Is your complex pipeline better than a simple approach?" → A0 vs A1
 2. "Does multi-model consensus actually help?" → A0 vs A2
 3. "Does image resizing hurt quality?" → A0 vs A5
+4. "Does prompt order matter? Did you validate it?" → A0 vs A9 (with paper citation)
+5. "Why weighted consensus — does it matter?" → A0 vs A11
+6. "Can you detect AI-generated fraud images?" → A0 vs A14
 
 ---
 
-### 22.5 Where Ablations Live in Code
+### 22.6 Where Ablations Live in Code
 
 ```
 evaluation/
 ├── main.py          # Runs A0 (full B) + A1 (Strategy A) on sample_claims.csv
-├── ablations.py     # Runs A2–A8 by toggling feature flags
+├── ablations.py     # Runs A2–A14 by toggling feature flags
 ├── metrics.py       # Pulls exact data from OpenRouter generation API
 └── report.py        # Generates comparison table + ablation matrix
 ```
