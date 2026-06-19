@@ -1224,6 +1224,158 @@ The model cannot anchor on the claim before forming a visual opinion.
 | SY3 | All 200 claims for same damage type | Handle each independently |
 | SY4 | OpenRouter credits exhausted mid-batch | Startup credit check + graceful halt |
 
+### 9.12 Severity Calibration Edge Cases
+
+The 14-field schema requires `severity ∈ {none, low, medium, high, unknown}`.
+These cases stress-test whether the model correctly places damage on the scale.
+
+| ID | Scenario | Expected Behavior |
+|---|---|---|
+| SV1 | Hairline scratch — visible only under direct light | `severity=low`, not `none` |
+| SV2 | Deep crack across full laptop screen | `severity=high` |
+| SV3 | Claimed "total loss" — image shows small dent | `severity=low` or `medium`; `claim_status=contradicted` if transcript says high |
+| SV4 | Multiple damage types in same image (dent + scratch) | `issue_type` = dominant type; `severity` = highest visible |
+| SV5 | Cosmetic vs functional: scratch on laptop lid | `severity=low`; functional damage not visible → NEI for function claim |
+| SV6 | Borderline low/medium: dent visible but shallow | System must not flip between runs — determinism check |
+| SV7 | Package corner crushed, contents visible intact | `issue_type=torn_packaging`, `severity=medium`; contents claim → NEI |
+| SV8 | `claim_status=not_enough_information` | `severity` must be `unknown` — consistency rule enforced |
+| SV9 | `claim_status=contradicted` + no damage visible | `severity=none`, `issue_type=none` |
+| SV10 | Severe damage across multiple object parts | `object_part` = primary claimed part; `severity=high` if that part affected |
+
+### 9.13 Three-Way Input Conflict (CSV vs Transcript vs Image)
+
+The most adversarial structural scenario: all three input sources disagree.
+
+| ID | Scenario | Resolution |
+|---|---|---|
+| TW1 | CSV: `car`, transcript: `laptop`, image: `package` | Use transcript object; flag `claim_mismatch`; image → `wrong_object` → NEI |
+| TW2 | CSV: `car`, transcript: silent on object, image: `laptop` | YOLO mismatch → `wrong_object`; use CSV object; image → NEI |
+| TW3 | CSV: `laptop`, transcript: `laptop`, image: ambiguous | Proceed; CLIP score low → flag `claim_mismatch` |
+| TW4 | CSV: `car`, transcript: `motorcycle` (not in schema) | Motorcycle → `claim_object=car` (closest); `issue_type=unknown`; `manual_review_required` |
+| TW5 | CSV: `package`, transcript: `parcel` (synonym) | Treat as `package`; no mismatch |
+| TW6 | All three agree but describe different damage types | No conflict on object; damage type resolved by Stage 3 |
+
+**Resolution rule:** Transcript > CSV when conflict exists on object type.
+Image is never used to override the stated claim object — only to evaluate evidence for it.
+
+### 9.14 Image File Format Edge Cases
+
+| ID | Scenario | Handler |
+|---|---|---|
+| IF1 | File exists but is 0 bytes | `valid_image=false`; skip |
+| IF2 | File is a `.txt` renamed to `.jpg` | PIL open fails → `valid_image=false`; skip |
+| IF3 | File is a PDF renamed to `.jpg` | PIL open fails → `valid_image=false`; skip |
+| IF4 | File is `.heic` (iPhone format) — not supported by default Pillow | `valid_image=false`; skip (HEIC requires `pillow-heif` plugin — not in requirements) |
+| IF5 | File is 4K resolution (3840×2160) | Resize to 768px; no skip; normal pipeline |
+| IF6 | File is 2×2 pixels (thumbnail) | After resize: too small to analyze meaningfully → `damage_not_visible` flag |
+| IF7 | File path contains Unicode characters or spaces | `Path(img_path)` handles this; test explicitly |
+| IF8 | File path is absolute when dataset uses relative paths | `Path(img_path).resolve()` handles; test explicitly |
+| IF9 | File path is a directory, not a file | `valid_image=false`; skip |
+| IF10 | File is a valid PNG but with a `.jpg` extension | PIL opens correctly; proceed normally |
+| IF11 | File is a valid animated GIF | PIL reads first frame only; proceed as static image |
+| IF12 | Image has no color channels (grayscale) | Blank detection adapts; CLIP handles; proceed |
+
+### 9.15 Confidence Tier Boundary Tests
+
+These test the exact thresholds defined in Section 27.
+Small differences in confidence must produce the correct tier outcome.
+
+| ID | Scenario | Expected Tier | Key Check |
+|---|---|---|---|
+| CB1 | Primary confidence = 0.85 exactly | Tier 0 (fast path) | Boundary is inclusive ≥ 0.85 |
+| CB2 | Primary confidence = 0.84 | Tier 1 (soft escalate) | Just below Tier 0 threshold |
+| CB3 | Primary confidence = 0.60 exactly | Tier 1 | Boundary is inclusive ≥ 0.60 |
+| CB4 | Primary confidence = 0.59 | Tier 2 (hard escalate, sticky flag) | Just below Tier 1 lower bound |
+| CB5 | All 3 models agree, all confidence = 0.50 exactly | Tier 3 terminal | Boundary is ≤ 0.50 for all |
+| CB6 | All 3 models agree, all confidence = 0.51 | Tier 1 or 2 depending on primary | Not terminal |
+| CB7 | Weighted aggregate = 0.699 (just below 0.70 gate) | `manual_review_required` added | Gate is strict |
+| CB8 | Weighted aggregate = 0.700 exactly | Accept without extra flag | Gate is inclusive |
+| CB9 | Primary conf = 0.90 but 2+ risk flags | Tier 1 triggered by flags, not score | Flag count overrides confidence |
+| CB10 | Primary returns NEI + confidence = 0.90 | Tier 2 (NEI triggers hard escalation regardless) | Verdict type overrides confidence score |
+
+### 9.16 Real-World Fraud Patterns (Beyond Hash Detection)
+
+These are sophisticated fraud strategies that bypass simple duplicate detection.
+
+| ID | Scenario | Detection Method |
+|---|---|---|
+| FR1 | **Inflation** — real minor scratch exists; transcript describes "deep gouge, full panel damage" | `claim_status=contradicted`; severity mismatch; `damage_not_visible` for claimed extent |
+| FR2 | **Upgrading** — hairline laptop screen crack; user describes "complete screen failure, total loss" | `claim_status=supported` for crack; `severity=low`; justification contradicts claimed total loss |
+| FR3 | **Substitution** — damaged item belongs to someone else (different serial/model visible) | API reasoning detects identifier mismatch; `non_original_image` + `manual_review_required` |
+| FR4 | **Staged damage** — dent is clearly from a hammer (too uniform, no paint distortion) | API reasoning flags pattern inconsistency; `manual_review_required` |
+| FR5 | **Time-shifted** — EXIF metadata removed/scrubbed; damage looks aged (rust, fading) | No EXIF date → `non_original_image` candidate; API notes weathering signs |
+| FR6 | **Pre-existing damage** — damage visible but appears healed/rusted/old in image | API reasoning: "damage appears old, inconsistent with recent incident claim" → `manual_review_required` |
+| FR7 | **Parallel claim** — user submits same evidence to two different claim IDs in batch | SHA-256 cross-claim collision → `user_history_risk` on second submission |
+| FR8 | **Identity washing** — real damage on correct object, but object is a replica/knockoff | YOLO detects correct class; API may detect brand inconsistency; `manual_review_required` |
+| FR9 | **Semantic near-duplicate** — reworded claim, slightly modified image (watermark removed) | ChromaDB semantic similarity > 0.88 → `claim_mismatch` + `user_history_risk` |
+| FR10 | **Accessory substitution** — damaged laptop BAG shown instead of laptop | YOLO: no laptop detected; `wrong_object`; `claim_status=not_enough_information` |
+
+### 9.17 Schema Consistency Stress Tests (Output-Specific)
+
+These specifically exercise the Stage 4b consistency checker and repair loop.
+Each case produces an output that must be caught and fixed before writing to output.csv.
+
+| ID | Scenario | Violation | Handler |
+|---|---|---|---|
+| SC1 | Model outputs `issue_type="glass_shatter"` for a package claim | Wrong object-type mapping for issue_type | Repair: "glass_shatter is not valid for package; valid: torn_packaging, water_damage, stain, missing_part" |
+| SC2 | Model outputs `supporting_image_ids` referencing a blurry (invalid) image | Invalid image cannot be a supporting image | Repair: "supporting_image_ids must only reference valid_image=true images" |
+| SC3 | Model outputs `object_part="unknown"` when part IS clearly visible | Inconsistency with visual evidence | Repair loop targets this field specifically |
+| SC4 | `severity="high"` + `issue_type="none"` | Impossible combination | Caught by Stage 4b rule 1 |
+| SC5 | `evidence_standard_met=false` + `claim_status="supported"` | Impossible combination | Caught by Stage 4b rule 6 |
+| SC6 | `risk_flags` contains duplicate flags (`"blurry_image;blurry_image"`) | Redundant, may confuse downstream | Repair: deduplicate flags |
+| SC7 | `valid_image` count ≠ image count (2 images, only 1 boolean in field) | Schema mismatch | Repair: "valid_image must have exactly N values for N submitted images" |
+| SC8 | `claim_status="contradicted"` + `supporting_image_ids` populated | Contradicted claims have no supporting images | Caught by Stage 4b rule 5 |
+| SC9 | `claim_status="not_enough_information"` + `severity="high"` | NEI = unknown severity | Caught by Stage 4b; severity forced to `unknown` |
+| SC10 | All 14 fields present but `claim_status_justification` is one word ("unclear") | Insufficient justification | Repair: "justification must reference specific visual evidence" |
+| SC11 | Model outputs extra fields not in schema (`"notes": "..."`) | Pydantic validation rejects extra fields | Pydantic `model_config = ConfigDict(extra="forbid")` |
+| SC12 | `confidence=1.0` returned by model on every single claim | Overconfidence signal | Log warning; escalation still runs based on verdict type and flags |
+
+### 9.18 Claim Scope Edge Cases
+
+| ID | Scenario | Correct Output |
+|---|---|---|
+| CS1 | Damage to laptop BAG — not the laptop | `wrong_object`; NEI for laptop claim |
+| CS2 | Damage to car CONTENTS (phone on seat) — not car itself | `wrong_object`; NEI for car claim |
+| CS3 | User claims BOTH dent AND scratch — which is the primary claim? | Extract primary/final claim from transcript; single issue_type |
+| CS4 | Damage exists but clearly from user negligence (coffee spill visible, no packaging) | Assess visually — verdict on what's visible; do not infer cause from image |
+| CS5 | Pre-existing damage visible alongside claimed new damage | Cannot distinguish old from new visually → NEI + `manual_review_required` |
+| CS6 | Claim is for an UPGRADE, not damage ("my laptop is slow, I want a new one") | No damage claim to verify; `issue_type=none`; NEI for damage evidence |
+| CS7 | User claims damage to item they don't appear to own (visible rental/fleet sticker) | Flag `manual_review_required`; verdict on visual damage is still assessed |
+| CS8 | User submits 3 separate claims for same object on same day | Each processed independently; SHA-256 + ChromaDB flag cross-claim similarity |
+
+### 9.19 Context Mismatch (Image vs Claimed Situation)
+
+The image often contains contextual cues that can corroborate or contradict the claim narrative.
+
+| ID | Scenario | Detection | Output |
+|---|---|---|---|
+| CX1 | User claims "hail damage overnight" — image shows indoor garage with no hail marks on surroundings | API reasoning: context inconsistency | `manual_review_required`; verdict on visible damage still assessed |
+| CX2 | User says "just happened" — image shows rust/fading consistent with months of exposure | API reasoning: aging signs | `non_original_image` candidate; `manual_review_required` |
+| CX3 | EXIF date is 6 months ago; user claims incident happened yesterday | EXIF check in Stage 2 | `non_original_image` flag; `manual_review_required` |
+| CX4 | Image shows summer foliage; user claims winter storm damage | API reasoning: seasonal inconsistency | `manual_review_required`; note in justification |
+| CX5 | Image shows dry conditions; user claims flood/water damage to package | Visible context vs claimed cause | `claim_status=contradicted` if no water damage visible |
+| CX6 | Image shows clean, dealership-condition car; user claims long-standing neglect damage | Clean context inconsistent with claim | API flags inconsistency; `manual_review_required` |
+| CX7 | Image timestamp burned into photo differs from EXIF timestamp | Both checked; discrepancy flagged | `non_original_image` + `manual_review_required` |
+
+### 9.20 Privacy-Sensitive Content in Images
+
+These scenarios do not change the verdict logic but must not cause pipeline failure or leakage.
+
+| ID | Scenario | Handler |
+|---|---|---|
+| PV1 | Car image includes clearly visible license plate | Verdict unaffected; do not extract or log license plate text |
+| PV2 | Laptop image shows personal documents on screen | Verdict unaffected; prompt instructs model to evaluate damage only |
+| PV3 | Car image includes person's face | Verdict unaffected; do not flag face as evidence |
+| PV4 | Package image shows full recipient name and home address on label | Verdict unaffected; do not extract or log PII from label |
+| PV5 | Image shows financial/medical documents as background | Verdict unaffected; model instructed to evaluate physical damage only |
+
+**Privacy rule in Stage 3 prompt:**
+```
+"Evaluate this image ONLY for physical damage evidence.
+ Do not extract, transcribe, or reference any personal information,
+ license plates, faces, addresses, or document text visible in the image."
+```
+
 ---
 
 ## 10. Evidence Requirements Mapping
