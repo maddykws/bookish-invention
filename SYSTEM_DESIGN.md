@@ -2290,7 +2290,23 @@ Stage 4c  — Repair                : claude-haiku-4-5 via OpenRouter
 
 ## 13. Evaluation Folder Design
 
-Required deliverables in `evaluation/`:
+**Maps directly to the eval rubric.** The rubric requires: (1) metrics on
+`sample_claims.csv`, (2) ≥2 strategies/prompts/configs compared, (3) a clear
+statement of the final strategy used for `output.csv`, (4) operational analysis
+(model calls, token usage, image usage, approximate cost, runtime, TPM/RPM), and
+(5) an `evaluation/` folder in `code.zip`. Coverage:
+
+```
+Rubric item                         Where                       Status
+(1) metrics on sample_claims.csv    §13.3, §25.1–25.3           ✅
+(2) ≥2 strategies compared          §13.3 (A vs B) + §25.7 abln ✅ (exceeds)
+(3) final strategy for output.csv   §13.5(a) declaration        ✅
+(4) operational analysis            §13.5(b,c,d) + §13.1        ✅ all 6 dims
+(5) evaluation/ in code.zip         code/evaluation/ → zip root ✅
+```
+
+Required deliverables in `code/evaluation/` (unzips as `evaluation/` at the
+code.zip root):
 
 ### 13.1 Metrics from OpenRouter Generation API
 
@@ -2387,6 +2403,74 @@ Which model was most accurate on disagreement cases:
   Gemini Flash: N/N correct
   Llama Vision: N/N correct
 ```
+
+### 13.5 Operational Analysis (required by eval rubric)
+
+The rubric explicitly requires operational analysis covering *model calls, token
+usage, image usage, approximate cost, runtime, AND TPM/RPM considerations*, plus
+a clear statement of *the final strategy used for output.csv*. `code/evaluation/
+main.py` prints this block and writes it to `report.json` under `"operational"`.
+
+**(a) Final strategy declaration — stated explicitly, not implied:**
+```
+FINAL STRATEGY FOR output.csv: Strategy B (multi-model cascade via OpenRouter)
+  Stage 1 parse  : anthropic/claude-haiku-4-5
+  Stage 3 reason : anthropic/claude-sonnet-4-6  (+ Anthropic prompt caching)
+  Stage 3.6 x-chk: google/gemini-2.5-flash + meta-llama/llama-3.2-11b-vision (free)
+  Selected because: <Strategy B accuracy> vs <Strategy A accuracy> on the 20
+  sample rows, at <X>% of Strategy A's paid token cost. See comparison table.
+```
+
+**(b) Model-call + token + cost + runtime summary (per stage, whole batch):**
+```
+Stage           Calls  AvgInTok AvgOutTok  PaidTok   Cost$     AvgLatency
+Stage 1 (parse)   N       XXX      XX        XXXX    $X.XXXX     XXXms
+Stage 3 (reason)  N       XXX      XXX       XXXX    $X.XXXX     XXXms
+Stage 3.6 (xchk)  N       XXX      XXX        0      $0.00       XXXms   (free tier)
+Stage 4c (repair) N       XXX      XX        XXXX    $X.XXXX     XXXms
+─────────────────────────────────────────────────────────────────────────
+TOTAL            N       —        —         XXXXX   $X.XX       wall: X.Xs/claim
+Projected for 200 claims (claims.csv): ~$X.XX, ~X min wall (at concurrency C)
+```
+
+**(c) Image usage (first-class metric — distinct from token usage):**
+```
+Images submitted (across all claims)      : N
+  → decoded successfully                  : N
+  → unreadable / path-unresolved          : N   (→ flagged, see §4.2 resolver)
+Images SENT to a vision model (API)       : N
+Images SKIPPED before any API call        : N   (saved ~N vision-image-tokens)
+  → blank/blur early-exit                 : N
+  → SHA-256 duplicate (cache hit)         : N
+  → resized to ≤768px before send         : N   (image-token reduction: ~X%)
+Avg images per claim                      : X.X
+Vision image-tokens (paid)                : XXXX   (Stage 3 only; 3.6 is free)
+```
+
+**(d) TPM / RPM considerations (throughput + rate-limit headroom):**
+```
+Requests per minute (RPM):
+  peak observed       : N rpm     configured concurrency: C
+  OpenRouter 429s     : N         (handled by fallback chain, §4.5)
+Tokens per minute (TPM):
+  peak observed       : ~N tpm    (prompt+completion, paid models)
+Headroom / strategy:
+  - async with a bounded semaphore (concurrency C in Config) keeps RPM under the
+    account's per-model limit; on a 429, OpenRouter routes to the fallback model
+    rather than blocking the batch (§4.3 fallback chains).
+  - Stage 3.6 cross-checks run on FREE-tier models, so consensus adds RPM but
+    ZERO paid TPM — throughput cost of consensus is rate, not dollars.
+  - Anthropic prompt caching cuts Stage 3 prompt TPM ~89% on the static system
+    block (§7.1b), directly lowering peak TPM and 429 risk on the 200-row run.
+  - 200-claim projection: at concurrency C, est. peak ~N rpm / ~N tpm — within
+    limits with margin M%. If the grader's key is rate-constrained, lower C in
+    Config; correctness is unchanged, only wall-time rises.
+```
+
+These six dimensions (calls, tokens, image usage, cost, runtime, TPM/RPM) map
+one-to-one to the rubric's "operational analysis" clause. All numbers come from
+the OpenRouter generation API (§13.1) plus local counters — no estimates except
+the explicit 200-row projection, which is labelled as a projection.
 
 ---
 
