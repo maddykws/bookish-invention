@@ -1205,7 +1205,176 @@ Our system is biased toward caution by design.
 
 ---
 
-## 22. The Unknown Unknown Principle
+## 22. Ablation Study
+
+Ablation means removing one component at a time and measuring what each part actually contributes. Without it, we can't prove our design choices were justified — we're just asserting them.
+
+### 22.1 What We Ablate and Why
+
+Each ablation answers a specific question the judge might ask:
+
+| Ablation | Component Removed | Question It Answers |
+|---|---|---|
+| A0 | Nothing — full Strategy B | Baseline for all comparisons |
+| A1 | Strategy A (Sonnet, single call) | Is our complexity worth it vs. a simple baseline? |
+| A2 | Consensus layer (Stage 3.5–3.7) | How much does multi-model agreement actually help? |
+| A3 | Local VLM pre-check (Stage 2.5) | Is the GPU damage pre-check earning its cost? |
+| A4 | CLIP semantic match (Stage 2g) | Does semantic pre-flagging reduce API errors? |
+| A5 | Image resize (Stage 2e) | Does shrinking images hurt accuracy? |
+| A6 | Image-first prompt order (Section 8.3) | Does prompt order actually prevent anchoring bias? |
+| A7 | EXIF + adversarial checks (Stage 2h, 2i) | Do fraud detection checks add value on the sample set? |
+| A8 | Repair loop (Stage 4c) | How often does self-healing actually fix real errors? |
+
+---
+
+### 22.2 Ablation Matrix
+
+Run each variant against the 20 sample claims with known ground truth:
+
+```
+Variant    Components Active                                  Accuracy   Tokens/claim   Cost    Latency
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+A0  Full B  YOLO+CLIP+LocalVLM+Haiku+Consensus+Repair        ?/20       ~900           $X      ~1,200ms
+A1  Strat A Sonnet single call only                          ?/20       ~1,200         $X      ~1,800ms
+A2  -Cons   YOLO+CLIP+LocalVLM+Haiku+Repair (no consensus)  ?/20       ~750           $X      ~1,000ms
+A3  -LVLM   YOLO+CLIP+Haiku+Consensus+Repair (no local VLM) ?/20       ~900           $X      ~900ms
+A4  -CLIP   YOLO+LocalVLM+Haiku+Consensus+Repair (no CLIP)  ?/20       ~900           $X      ~1,100ms
+A5  -Resize Full B but full-resolution images                ?/20       ~2,400         $X      ~2,000ms
+A6  -Order  Full B but transcript read BEFORE image          ?/20       ~900           $X      ~1,200ms
+A7  -Fraud  Full B without EXIF/adversarial noise checks     ?/20       ~900           $X      ~1,150ms
+A8  -Repair Full B without repair loop (fail → safe defaults)?/20       ~750           $X      ~1,000ms
+```
+
+All numbers filled in after code runs against sample_claims.csv.
+
+---
+
+### 22.3 What We Expect Each Ablation to Show
+
+**A1 vs A0 (Strategy A vs full B):**
+```
+Expected: A0 >= A1 in accuracy, A0 < A1 in cost
+If A1 matches A0 accuracy at lower cost → Strategy B is over-engineered
+If A0 beats A1 → complexity is justified
+This is the primary evaluation story.
+```
+
+**A2 vs A0 (remove consensus):**
+```
+Expected: A2 slightly lower accuracy on ambiguous claims
+Consensus should help on the ~30% of claims where primary model hedges.
+If A2 = A0 → consensus adds no value, should be removed
+If A2 < A0 → consensus is earning its place (even at $0 via free models)
+```
+
+**A3 vs A0 (remove local VLM):**
+```
+Expected: A3 = A0 in accuracy (local VLM is a pre-filter, not a reasoner)
+But A3 costs slightly more (no early exit on "no damage visible")
+If A3 < A0 → local VLM is catching errors before they reach the API
+If A3 = A0 → local VLM only saves cost, not accuracy
+```
+
+**A4 vs A0 (remove CLIP):**
+```
+Expected: A4 slightly lower on claim_mismatch cases
+CLIP pre-flagging informs the API prompt — removing it means the
+primary model gets no hint about semantic mismatch.
+If A4 = A0 → CLIP adds no signal the model wouldn't find anyway
+If A4 < A0 → CLIP pre-flagging genuinely helps on mismatch cases
+```
+
+**A5 vs A0 (no image resize):**
+```
+Expected: A5 = A0 in accuracy (full-res shouldn't help for damage detection)
+But A5 costs 3-5× more in vision tokens.
+If A5 > A0 → high-res actually helps for fine-grained damage (surprising!)
+If A5 = A0 → resize is pure cost savings, confirmed safe
+```
+
+**A6 vs A0 (transcript before image):**
+```
+Expected: A6 < A0 on cases where transcript is misleading or injected
+This tests our core claim that image-first prevents anchoring bias.
+If A6 = A0 → order doesn't matter (our assumption was wrong)
+If A6 < A0 → image-first prompt order is genuinely protective
+Key cases to watch: AD8 (injected text), CT2 (exaggerated severity claim)
+```
+
+**A7 vs A0 (no fraud checks):**
+```
+Expected: A7 = A0 on the 20 sample cases (fraud cases may be rare in sample)
+But A7 is a correctness risk on the full 200 claims.
+Mainly validates that fraud checks don't introduce false positives.
+```
+
+**A8 vs A0 (no repair loop):**
+```
+Expected: A8 slightly lower (some claims get safe defaults instead of repaired output)
+Tells us: what % of claims actually needed the repair loop?
+If repair_attempts = 0 across all 20 → repair loop had no effect on sample set
+If repair_attempts > 0 → repair loop fixed real failures
+```
+
+---
+
+### 22.4 Minimum Ablations for Submission
+
+If time is limited, run at least these three:
+
+```
+Priority 1: A0 vs A1  (Strategy B vs Strategy A — the primary comparison)
+Priority 2: A0 vs A2  (with vs without consensus — the novel contribution)
+Priority 3: A0 vs A5  (with vs without resize — validates cost assumption)
+```
+
+These three together answer the three most likely judge questions:
+1. "Is your complex pipeline better than a simple approach?" → A0 vs A1
+2. "Does multi-model consensus actually help?" → A0 vs A2
+3. "Does image resizing hurt quality?" → A0 vs A5
+
+---
+
+### 22.5 Where Ablations Live in Code
+
+```
+evaluation/
+├── main.py          # Runs A0 (full B) + A1 (Strategy A) on sample_claims.csv
+├── ablations.py     # Runs A2–A8 by toggling feature flags
+├── metrics.py       # Pulls exact data from OpenRouter generation API
+└── report.py        # Generates comparison table + ablation matrix
+```
+
+Each ablation is controlled by a feature flag dictionary:
+```python
+ABLATION_CONFIG = {
+    "use_consensus":    True,   # False → A2
+    "use_local_vlm":    True,   # False → A3
+    "use_clip":         True,   # False → A4
+    "resize_images":    True,   # False → A5
+    "image_first":      True,   # False → A6
+    "fraud_checks":     True,   # False → A7
+    "use_repair_loop":  True,   # False → A8
+}
+```
+
+Toggle one flag at a time. Same pipeline code runs all variants. No duplicate logic.
+
+---
+
+### 22.6 Honest Reporting
+
+If an ablation shows a component adds no value:
+```
+Report it honestly.
+Remove the component from the final submission if it adds complexity with no benefit.
+A simpler system that works is better than a complex system with dead weight.
+The ablation proving a component is unnecessary is itself a valuable finding.
+```
+
+---
+
+## 23. The Unknown Unknown Principle
 
 > No enumeration of test cases is complete.
 > Real users will submit inputs that no designer anticipated.
