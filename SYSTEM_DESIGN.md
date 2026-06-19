@@ -513,6 +513,41 @@ def history_preflag(history: UserHistory | None) -> list[str]:
     return flags
 ```
 
+**History must surface in BOTH risk_flags AND the justification (required).**
+The official guidance reads: *"Use history to add risk context through
+`risk_flags` and justifications."* That names two output surfaces — covering only
+`risk_flags` leaves the requirement half-met. The rule:
+
+```
+RULE H1 — justification-surfacing
+  IF history caused a flag to be raised
+     (user_history_risk or history-driven manual_review_required)
+  THEN claim_status_justification MUST state the history reason, using the
+       CONCRETE numbers — not a vague "user flagged".
+
+  Good:  "Damage is clearly visible and the claim is supported; however the
+          user has 4 claims in the last 90 days with a 50% historical rejection
+          rate (3/6), so the claim is additionally flagged for manual review."
+  Bad:   "User history risk."            (no numbers, not grounded)
+  Bad:   <flag set, justification silent about why>   (fails "and justifications")
+
+RULE H2 — context-not-verdict (unchanged, reaffirmed)
+  History may color the justification and raise flags, but the VERDICT sentence
+  of the justification must be grounded in the IMAGE. History never appears as
+  the reason a claim is contradicted. A clean image + bad history → supported
+  (+ manual_review_required), and the justification says exactly that.
+
+RULE H3 — verdict-shaping language is fenced
+  In the justification, history may only ever justify *manual_review_required*
+  or *user_history_risk*. It may NOT be cited as evidence for supported or
+  contradicted. The image carries the verdict; history carries the review flag.
+```
+
+The Stage 3 prompt is instructed to compute and cite the concrete figures
+(`rejection_rate`, `last_90_days_claim_count`) whenever a history flag fires, so
+the "and justifications" half of the guidance is satisfied by construction, not
+left to chance. When `history is None` (new user), no history sentence is added.
+
 ---
 
 ### 4.4 Input 4 — Minimum Evidence Requirements
