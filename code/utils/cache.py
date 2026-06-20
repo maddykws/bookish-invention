@@ -18,9 +18,18 @@ log = get_logger("pipeline.cache")
 
 
 class ClaimCache:
-    def __init__(self, cache_path: str = ".cache/llm_responses.json") -> None:
+    def __init__(
+        self, cache_path: str = ".cache/llm_responses.json", namespace: str = "live"
+    ) -> None:
+        # `namespace` salts every key AND segregates the disk file so dry-run stub
+        # verdicts can never be served to a live grading run (and vice versa). A
+        # dry-run before grading must not poison real results.
         self._memory: dict[str, dict] = {}
-        self._path = Path(cache_path)
+        self._namespace = namespace
+        base = Path(cache_path)
+        if namespace != "live":
+            base = base.with_name(f"{base.stem}.{namespace}{base.suffix}")
+        self._path = base
         self._path.parent.mkdir(parents=True, exist_ok=True)
         if self._path.exists():
             try:
@@ -31,9 +40,8 @@ class ClaimCache:
         self.hits = 0
         self.misses = 0
 
-    @staticmethod
-    def _key(claim_text: str, image_hashes: list[str]) -> str:
-        raw = claim_text + "|" + "|".join(sorted(image_hashes))
+    def _key(self, claim_text: str, image_hashes: list[str]) -> str:
+        raw = self._namespace + "|" + claim_text + "|" + "|".join(sorted(image_hashes))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def get(self, claim_text: str, image_hashes: list[str]) -> ClaimOutput | None:

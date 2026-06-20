@@ -84,7 +84,8 @@ def run(cfg: Config, input_path: str, output_path: str, limit: int | None) -> in
         cfg=cfg, provider=provider, client=LLMClient(cfg, provider),
         history=load_user_history(cfg.user_history_path),
         requirements=load_evidence_requirements(cfg.evidence_req_path),
-        cache=ClaimCache(cfg.cache_path), memory=ClaimMemory(cfg),
+        cache=ClaimCache(cfg.cache_path, namespace="dry" if cfg.dry_run else "live"),
+        memory=ClaimMemory(cfg),
     )
 
     outputs = []

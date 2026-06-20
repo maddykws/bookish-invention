@@ -101,7 +101,11 @@ def run(cfg: Config) -> int:
         cfg=cfg, provider=provider, client=LLMClient(cfg, provider),
         history=load_user_history(cfg.user_history_path),
         requirements=load_evidence_requirements(cfg.evidence_req_path),
-        cache=ClaimCache(".cache/eval_responses.json"), memory=ClaimMemory(cfg),
+        cache=ClaimCache(
+            ".cache/eval_responses.json",
+            namespace="dry" if cfg.dry_run else "live",
+        ),
+        memory=ClaimMemory(cfg),
     )
 
     truth, pred_a, pred_b = [], [], []
