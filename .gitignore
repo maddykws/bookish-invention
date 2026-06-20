@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# Secrets
+.env
+*.env
+
+# Logs and data
+logs/
+*.json
+!prompts/**/*.json
+
+# ChromaDB persistent storage
+chroma_db/
+.chroma/
+
+# Pipeline run artifacts (regenerated each run)
+.cache/
+.checkpoint
+.checkpoint.json
+
+# Dataset is provided by the grader at runtime — never commit it (incl. local
+# synthetic test fixtures). Output is generated, not committed.
+dataset/
+output.csv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

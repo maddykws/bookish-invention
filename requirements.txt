@@ -1,0 +1,18 @@
+# Core dependencies — always install, no GPU required.
+# This set alone runs the full CLOUD-FIRST pipeline and produces output.csv.
+# All local-vision acceleration is optional (see requirements-local.txt) and
+# import-guarded: if torch/ultralytics/transformers are absent, the pipeline
+# auto-degrades to OpenRouter-only vision. Keep this file torch-free.
+
+openai>=1.50.0                  # OpenRouter spine (OpenAI-compatible client + extra_headers/X-Title)
+pydantic>=2.7.0
+python-dotenv>=1.0.0
+requests>=2.31.0                # OpenRouter generation API polling (exact cost/latency)
+pillow>=10.0.0                  # image decode, blank detection, resize
+numpy>=1.26.0                   # FFT artifact check, histogram blank detection
+opencv-python-headless>=4.9.0   # Laplacian blur score (headless: no GUI/X11 deps on servers)
+pandas>=2.2.0                   # CSV IO + evaluation metrics
+rich>=13.7.0                    # console logging
+tqdm>=4.66.0                    # batch progress
+pyyaml>=6.0.0
+chromadb>=0.5.0                 # cross-claim semantic fraud; uses built-in ONNX embedder (no torch)

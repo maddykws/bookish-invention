@@ -1,0 +1,11 @@
+# PLACEHOLDER — overwritten by scaffold.py on question drop
+version: "1.0"
+model: "claude-sonnet-4-6"
+created: "2026-05-01"
+changed_from: null
+reason: "Placeholder before question drop"
+metric_before: null
+metric_after: null
+prompt: |
+  You are a helpful AI agent. This prompt will be replaced by scaffold.py
+  when the hackathon question drops.
