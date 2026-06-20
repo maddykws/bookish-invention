@@ -101,6 +101,13 @@ class Config:
     token_budget_per_claim: int = 2000
     transcript_max_turns: int = 8
     consensus_trigger_threshold: int = 2
+    request_timeout_s: float = 90.0       # per-call OpenAI/OpenRouter timeout
+    max_tokens_stage1: int = 600          # transcript parse output cap
+    max_tokens_stage3: int = 900          # verdict output cap (terse justifications)
+    max_tokens_jury: int = 300            # jury mini-schema output cap
+    max_tokens_repair: int = 600          # targeted repair output cap
+    jury_max_workers: int = 4             # parallel jury calls
+    dry_run: bool = False                 # offline plumbing test — deterministic stub verdicts
 
     # ── Confidence / escalation thresholds ───────────────────────────────────
     confidence_tier0_threshold: float = 0.85

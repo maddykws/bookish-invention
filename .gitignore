@@ -33,6 +33,11 @@ chroma_db/
 .checkpoint
 .checkpoint.json
 
+# Dataset is provided by the grader at runtime — never commit it (incl. local
+# synthetic test fixtures). Output is generated, not committed.
+dataset/
+output.csv
+
 # IDE
 .vscode/
 .idea/

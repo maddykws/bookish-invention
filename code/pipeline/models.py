@@ -20,6 +20,14 @@ class ClaimRow(BaseModel):
     user_claim: str            # actual column name in dataset CSV
     claim_object: Literal["car", "laptop", "package"]
 
+    @property
+    def image_path_list(self) -> list[str]:
+        return [p.strip() for p in self.image_paths.split(";") if p.strip()]
+
+    @property
+    def image_count(self) -> int:
+        return len(self.image_path_list)
+
 
 class UserHistory(BaseModel):
     user_id: str
