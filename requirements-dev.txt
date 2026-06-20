@@ -1,0 +1,14 @@
+# OPTIONAL observability, richer evaluation, and demo UI.
+# NOT required to produce output.csv. All import-guarded.
+#
+#   pip install -r requirements-dev.txt
+#
+-r requirements.txt
+langfuse>=2.0.0                                 # per-claim tracing
+arize-phoenix>=5.0.0                            # local trace visualization
+openinference-instrumentation-openai>=0.1.0    # OpenAI/OpenRouter span capture
+opentelemetry-api>=1.28.0
+opentelemetry-sdk>=1.28.0
+deepeval>=1.0.0                                 # optional LLM-graded eval metrics
+gradio>=4.0.0                                   # demo UI
+pytest>=8.0.0

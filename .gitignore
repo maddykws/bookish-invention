@@ -26,6 +26,17 @@ logs/
 
 # ChromaDB persistent storage
 chroma_db/
+.chroma/
+
+# Pipeline run artifacts (regenerated each run)
+.cache/
+.checkpoint
+.checkpoint.json
+
+# Dataset is provided by the grader at runtime — never commit it (incl. local
+# synthetic test fixtures). Output is generated, not committed.
+dataset/
+output.csv
 
 # IDE
 .vscode/
