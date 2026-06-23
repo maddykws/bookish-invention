@@ -136,6 +136,7 @@ def run(cfg: Config) -> int:
             "final_strategy_for_output_csv": "Strategy B (multi-model cascade)",
             "stage3_primary_model": cfg.stage3_primary_model,
             "provider": provider.name,
+            "consensus_enabled": cfg.use_consensus,
             "escalation_tiers": dict(tier_counts),
             "cache": ctx.cache.stats(),
             "dry_run": cfg.dry_run,
@@ -170,10 +171,15 @@ def main() -> None:
     load_dotenv()
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-consensus", action="store_true",
+                    help="isolate the core pipeline: Opus verdict + Stage-4 validation only "
+                         "(consensus jury off)")
     args = ap.parse_args()
     cfg = CFG
     if args.dry_run:
         cfg.dry_run = True
+    if args.no_consensus:
+        cfg.use_consensus = False
     sys.exit(run(cfg))
 
 

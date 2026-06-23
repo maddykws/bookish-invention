@@ -107,6 +107,10 @@ class Config:
     max_tokens_jury: int = 300            # jury mini-schema output cap
     max_tokens_repair: int = 600          # targeted repair output cap
     jury_max_workers: int = 4             # parallel jury calls
+    jury_deadline_s: float = 45.0         # overall wall-clock cap for the jury (all jurors); a
+                                          # stalled juror can never hang the batch — the verdict
+                                          # already stands on Opus, so we proceed with whatever
+                                          # jurors finished in time (degrade safe)
     dry_run: bool = False                 # offline plumbing test — deterministic stub verdicts
 
     # ── Confidence / escalation thresholds ───────────────────────────────────

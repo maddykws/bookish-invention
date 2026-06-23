@@ -132,11 +132,16 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--dry-run", action="store_true",
                     help="offline plumbing test: deterministic stubs, no network/tokens")
+    ap.add_argument("--no-consensus", action="store_true",
+                    help="isolate the core pipeline: Opus verdict + Stage-4 validation only "
+                         "(consensus jury off). Clean, complete results without the jury path.")
     args = ap.parse_args()
 
     cfg = CFG
     if args.dry_run:
         cfg.dry_run = True
+    if args.no_consensus:
+        cfg.use_consensus = False
     sys.exit(run(cfg, args.input, args.output, args.limit))
 
 

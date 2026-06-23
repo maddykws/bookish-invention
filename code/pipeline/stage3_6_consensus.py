@@ -8,7 +8,8 @@ normalized over whichever models actually ran (§27.3).
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from time import monotonic as _now
 
 from code.config import Config
 from code.pipeline.models import CrossCheckResult
@@ -46,7 +47,6 @@ def run_jury(
     if tier >= 2:
         models += list(cfg.consensus_paid_models)
 
-    results: list[CrossCheckResult] = []
     tasks: list[tuple[str, LLMClient]] = []
     for m in models:
         prov = resolve_jury_provider(m, cfg, primary)
@@ -57,16 +57,51 @@ def run_jury(
     if not tasks:
         return []
 
-    with ThreadPoolExecutor(max_workers=cfg.jury_max_workers) as pool:
-        futs = {
-            pool.submit(_one_juror, m, cl, claim_text, claim_object,
-                        image_ids, image_data_urls, cfg): m
-            for m, cl in tasks
-        }
-        for fut in as_completed(futs):
-            r = fut.result()
-            if r is not None:
-                results.append(r)
+    # The jury is best-effort second opinions; the verdict already stands on Opus.
+    # So NO juror may take down the claim and NO juror may hang the batch:
+    #   (1) each juror runs on its own DAEMON thread — a stalled juror is
+    #       fire-and-forget and can never block the batch or outlive the process;
+    #   (2) each juror is exception-wrapped, so a malformed/empty provider response
+    #       degrades to a dropped juror instead of propagating;
+    #   (3) the whole jury is bounded by an overall wall-clock deadline. On the
+    #       deadline we proceed with whatever finished (degrade safe).
+    # Concurrency is still capped at jury_max_workers via a semaphore.
+    deadline = max(0.0, float(cfg.jury_deadline_s))
+    gate = threading.Semaphore(max(1, cfg.jury_max_workers))
+    slots: list[CrossCheckResult | None] = [None] * len(tasks)
+    pending = threading.Semaphore(0)  # released once per finished juror
+
+    def worker(idx: int, model: str, client: LLMClient) -> None:
+        try:
+            with gate:
+                slots[idx] = _one_juror(model, client, claim_text, claim_object,
+                                        image_ids, image_data_urls, cfg)
+        except Exception as exc:  # noqa: BLE001 — a failed juror must not kill the claim
+            log.warning("Juror %s failed (%s) — dropped; verdict stands on Opus.",
+                        _short(model), type(exc).__name__)
+        finally:
+            pending.release()
+
+    for i, (m, cl) in enumerate(tasks):
+        threading.Thread(target=worker, args=(i, m, cl), daemon=True,
+                         name=f"jury-{_short(m)}").start()
+
+    # Wait for all jurors, but never past the overall deadline.
+    end = _now() + deadline
+    finished = 0
+    for _ in range(len(tasks)):
+        remaining = end - _now()
+        if remaining <= 0 or not pending.acquire(timeout=remaining):
+            break
+        finished += 1
+
+    results = [r for r in slots if r is not None]
+    if finished < len(tasks):
+        log.warning(
+            "Jury deadline (%.0fs) hit — %d/%d juror(s) unfinished; proceeding "
+            "with %d result(s). Verdict stands on Opus.",
+            deadline, len(tasks) - finished, len(tasks), len(results),
+        )
     return results
 
 
