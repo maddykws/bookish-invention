@@ -55,7 +55,7 @@ class EvidenceLedger:
         return "\n\n".join(lines)
 
     def all_outputs(self) -> str:
-        return " ".join(e.tool_output.lower() for e in self.entries)
+        return " ".join(e.tool_output for e in self.entries)
 
     def is_empty(self) -> bool:
         return len(self.entries) == 0

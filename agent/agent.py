@@ -171,7 +171,7 @@ def build_agent(system_prompt: str, ledger: EvidenceLedger) -> Agent:
     from agent.tools import TOOLS
     agent: Agent[None, AgentAnswer] = Agent(
         model=f"anthropic:{MODEL}",
-        result_type=AgentAnswer,
+        output_type=AgentAnswer,
         system_prompt=system_prompt,
     )
     for tool_fn in TOOLS:
@@ -218,7 +218,7 @@ async def _single_attempt(
     else:
         agent = build_agent(system_prompt, ledger)
         run_result = await agent.run(context_prefix + task)
-        draft = run_result.data
+        draft = run_result.output
 
     # ── Self-critique ─────────────────────────────────────────────────────────
     critique_result = await self_critique(

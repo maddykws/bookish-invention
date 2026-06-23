@@ -25,6 +25,8 @@ class ExampleOutput(BaseModel):
 
 
 async def example_tool(ctx: RunContext[None], input: ExampleInput) -> ExampleOutput:
+    """Placeholder tool — returns a stub result until scaffold.py overwrites this
+    file with problem-specific tools on question drop."""
     # TODO: implement — replace this entire file via scaffold.py on question drop
     return ExampleOutput(result="placeholder", source="placeholder")
 

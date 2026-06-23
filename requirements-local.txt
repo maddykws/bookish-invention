@@ -1,0 +1,13 @@
+# OPTIONAL local-vision acceleration. Multi-GB; benefits from a CUDA GPU.
+# Import-guarded everywhere: if these are not installed, the pipeline skips
+# Stage 2.5 (local VLM) and Stage 2g (CLIP/YOLO) and lets OpenRouter handle all
+# vision. Installing this never changes correctness, only cost/latency.
+#
+#   pip install -r requirements-local.txt
+#
+-r requirements.txt
+torch>=2.3.0
+torchvision>=0.18.0
+transformers>=4.40.0            # local VLM (Qwen2-VL / Llama-3.2-Vision) + CLIP
+ultralytics>=8.2.0             # YOLOv8 object pre-detection
+sentence-transformers>=3.0.0   # higher-quality cross-claim embeddings (vs ChromaDB ONNX default)
