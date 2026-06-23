@@ -66,7 +66,7 @@ class MultiAgentOrchestrator:
     def _build_specialist_agent(self, specialist: Specialist) -> Agent:
         agent: Agent[None, AggregatedAnswer] = Agent(
             model=f"anthropic:{self.model}",
-            result_type=AggregatedAnswer,
+            output_type=AggregatedAnswer,
             system_prompt=specialist.system_prompt,
         )
         for tool_fn in specialist.tools:
@@ -87,7 +87,7 @@ class MultiAgentOrchestrator:
         )
         return Agent(
             model=f"anthropic:{self.model}",
-            result_type=RoutingDecision,
+            output_type=RoutingDecision,
             system_prompt=system,
         )
 
@@ -100,7 +100,7 @@ class MultiAgentOrchestrator:
         )
         return Agent(
             model=f"anthropic:{self.model}",
-            result_type=AggregatedAnswer,
+            output_type=AggregatedAnswer,
             system_prompt=system,
         )
 
@@ -110,7 +110,7 @@ class MultiAgentOrchestrator:
         # ── Step 1: Route ─────────────────────────────────────────────────────
         router = self._build_router_agent()
         routing_result = await router.run(task)
-        decision: RoutingDecision = routing_result.data
+        decision: RoutingDecision = routing_result.output
 
         console.print(f"  Subtasks: {len(decision.subtasks)}")
         console.print(f"  Routing: {decision.specialist_assignments}")
@@ -131,7 +131,7 @@ class MultiAgentOrchestrator:
             specialist = self.specialists[name]
             agent = self._build_specialist_agent(specialist)
             result = await agent.run(subtask)
-            return result.data
+            return result.output
 
         tasks = [
             run_specialist(name, subtask)
@@ -166,7 +166,7 @@ class MultiAgentOrchestrator:
         agg_result = await aggregator.run(
             f"Original task: {task}\n\nSpecialist results:\n{combined}"
         )
-        final: AggregatedAnswer = agg_result.data
+        final: AggregatedAnswer = agg_result.output
         final.specialists_used = list(decision.specialist_assignments.keys())
         final.tools_used = list({t for r in valid_results for t in r.tools_used})
         return final
