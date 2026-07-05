@@ -37,5 +37,5 @@ chroma_db/
 .DS_Store
 Thumbs.db
 
-# Packaged deliverable output
-gifs/out_package/
+# Packaged deliverable: ignore the unzipped staging folder, keep the zip
+gifs/out_package/gpu_ai_linkedin_gif_series/
