@@ -36,3 +36,6 @@ chroma_db/
 # OS
 .DS_Store
 Thumbs.db
+
+# Packaged deliverable output
+gifs/out_package/
