@@ -102,9 +102,9 @@ def scene(c: Canvas, lt, gt, punch=0.0):
 
 def main():
     tl = g.Timeline(W, H, FPS)
-    tl.scene(4.0, scene)
-    tl.scene(0.5, lambda c, lt, gt: scene(c, 1.0, gt))
-    tl.scene(2.2, lambda c, lt, gt: scene(c, 1.0, gt, punch=lt))
+    tl.scene(3.4, scene)
+    tl.scene(0.3, lambda c, lt, gt: scene(c, 1.0, gt))
+    tl.scene(1.6, lambda c, lt, gt: scene(c, 1.0, gt, punch=lt))
     frames = tl.build()
     out = os.path.join(os.path.dirname(__file__), "out", "day_04_tensor_cores_unleashed.gif")
     g.render(frames, out, fps=FPS)

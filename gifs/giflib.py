@@ -136,6 +136,31 @@ class Canvas:
             self.d.rounded_rectangle([x0, y0, x0 + w, y1],
                                      radius=(y1 - y0) // 2, fill=color)
 
+    # -- a labeled vertical meter (0..1), fills bottom-up -------------------
+    def vmeter(self, box, value, color, track=PANEL_HI):
+        x0, y0, x1, y1 = box
+        r = (x1 - x0) // 2
+        self.d.rounded_rectangle(box, radius=r, fill=track)
+        h = (y1 - y0) * clamp(value)
+        if h > 2:
+            self.d.rounded_rectangle([x0, y1 - h, x1, y1], radius=r, fill=color)
+
+    # -- polyline curve through points --------------------------------------
+    def curve(self, points, color, width=3):
+        if len(points) >= 2:
+            self.d.line(points, fill=color, width=width, joint="curve")
+
+    # -- a labeled node box (used by pipeline/ring archetypes) --------------
+    def node(self, cx, cy, w, h, label, fill=PANEL, outline=MUTED,
+             text_color=INK, size=15, sub=None, radius=10):
+        self.d.rounded_rectangle([cx - w/2, cy - h/2, cx + w/2, cy + h/2],
+                                 radius=radius, fill=fill, outline=outline, width=2)
+        if sub:
+            self.text((cx, cy - 9), label, size=size, bold=True, fill=text_color, anchor="mm")
+            self.text((cx, cy + 12), sub, size=12, fill=MUTED, anchor="mm")
+        else:
+            self.text((cx, cy), label, size=size, bold=True, fill=text_color, anchor="mm")
+
 
 def title_bar(c: Canvas, title, subtitle=None):
     """A faux window title bar with traffic-light dots — the series signature."""
@@ -168,12 +193,12 @@ def punch_overlay(c: Canvas, text, alpha=0.0, sub=None):
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
-def render(frames, path, fps=20, loop=0):
+def render(frames, path, fps=20, loop=0, colors=128):
     """Write a list of PIL.Image frames to a looping GIF."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     duration = int(1000 / fps)
     # Adaptive palette per frame keeps gradients/meters clean.
-    conv = [f.convert("P", palette=Image.ADAPTIVE, colors=256) for f in frames]
+    conv = [f.convert("P", palette=Image.ADAPTIVE, colors=colors) for f in frames]
     conv[0].save(path, save_all=True, append_images=conv[1:],
                  duration=duration, loop=loop, disposal=2, optimize=True)
     return path

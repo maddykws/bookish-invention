@@ -107,9 +107,9 @@ def scene_punch(c: Canvas, lt, gt):
 
 def main():
     tl = g.Timeline(W, H, FPS)
-    tl.scene(1.8, scene_lockstep)
-    tl.scene(3.6, scene_split)
-    tl.scene(2.2, scene_punch)
+    tl.scene(1.2, scene_lockstep)
+    tl.scene(2.6, scene_split)
+    tl.scene(1.6, scene_punch)
     frames = tl.build()
     out = os.path.join(os.path.dirname(__file__), "out", "day_02_warp_divergence.gif")
     g.render(frames, out, fps=FPS)

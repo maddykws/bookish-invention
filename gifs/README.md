@@ -5,15 +5,24 @@ Programmatic, schematic animated GIFs for the 60-day GPU/AI LinkedIn series
 consistent dark "developer terminal" look, baked-in on-screen text, and a
 punchline card — no external services.
 
-## Status: proof of concept
+## Status: all 60 rendered
 
-3 of 60 rendered so far, one Python file per day:
+`out/` contains all 60 GIFs (`day_01_*.gif` … `day_60_*.gif`), each a looping
+animation **strictly under 6 seconds** (5.2–5.45 s). They're produced two ways:
 
-| Day | Script | Output |
-|----|--------|--------|
-| 01 | `day_01_gpu_memory_coalescing.py` | `out/day_01_gpu_memory_coalescing.gif` |
-| 02 | `day_02_warp_divergence.py` | `out/day_02_warp_divergence.gif` |
-| 04 | `day_04_tensor_cores_unleashed.py` | `out/day_04_tensor_cores_unleashed.gif` |
+- **Days 1, 2, 4** — bespoke scripts (`day_01/02/04_*.py`), the original
+  hand-tuned proofs of concept.
+- **Days 3, 5–60** — data-driven configs in `days.py`, rendered by `build.py`
+  through the 9 reusable archetypes in `archetypes.py`.
+
+Every loop is `intro(0.25s) + action(3.4s) + hold(0.3s) + punchline(1.5s)`.
+
+### The 9 archetypes (`archetypes.py`)
+
+`bars_race` · `grid_states` · `gauge_spike` · `flow_pipeline` · `ring_net` ·
+`compare_paths` · `timeline_track` · `stack_build` · `type_reveal` — mixed
+across the 60 days so the series stays visually varied. Each day in `days.py`
+maps a topic to one archetype plus its labels, curve/pattern, and punchline.
 
 ## Setup
 
@@ -29,9 +38,11 @@ elsewhere.
 ## Render
 
 ```bash
-python3 day_01_gpu_memory_coalescing.py     # writes out/<name>.gif
-# render everything:
-for f in day_*.py; do python3 "$f"; done
+# bespoke days:
+python3 day_01_gpu_memory_coalescing.py      # writes out/<name>.gif
+# data-driven days (all of 3, 5-60):
+python3 build.py                             # render every config
+python3 build.py 5 20 44                      # render only these day numbers
 ```
 
 ## Framework (`giflib.py`)

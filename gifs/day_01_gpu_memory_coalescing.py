@@ -119,10 +119,10 @@ def scene_punch(c: Canvas, lt, gt):
 
 def main():
     tl = g.Timeline(W, H, FPS)
-    tl.scene(0.4, lambda c, lt, gt: (c.grid(), g.title_bar(c, "cuda ~ memory coalescing", "warp = 8 lanes")))
-    tl.scene(3.2, scene_main)
-    tl.scene(0.6, lambda c, lt, gt: scene_main(c, 1.0, gt))
-    tl.scene(2.2, scene_punch)
+    tl.scene(0.3, lambda c, lt, gt: (c.grid(), g.title_bar(c, "cuda ~ memory coalescing", "warp = 8 lanes")))
+    tl.scene(2.8, scene_main)
+    tl.scene(0.4, lambda c, lt, gt: scene_main(c, 1.0, gt))
+    tl.scene(1.7, scene_punch)
     frames = tl.build()
     out = os.path.join(os.path.dirname(__file__), "out", "day_01_gpu_memory_coalescing.gif")
     g.render(frames, out, fps=FPS)
